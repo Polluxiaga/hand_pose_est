@@ -1,18 +1,16 @@
 .DS_Store
 __pycache__/
 *.pyc
-~$*.xlsx
 
 # Large local dataset
-new_dof_match
-new_dof_batch_results_test
+dof_match
+dof_batch_results
 
 # Common local outputs
 pose_inhand_local_*/
 tmp_pose_outputs/
 
 venv/
-new_dof_batch_results/batch_summary.xlsx
-new_dof_batch_results/batch_summary.json
+tapir/
 
-tapnet/checkpoints/tapir_checkpoint_panning.pt
+generate_comparison_table.py

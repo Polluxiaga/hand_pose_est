@@ -113,7 +113,7 @@ class RegistrationConfig:
     # ICP refinement
     gicp_max_corr_dist: float = 0.04
     gicp_max_iter: int = 60
-    use_colored_icp: bool = True
+    use_colored_icp: bool = False
     colored_icp_max_corr_dist: float = 0.03
     colored_icp_max_iter: int = 30
 
@@ -308,21 +308,23 @@ def _iqr_filter(pcd: o3d.geometry.PointCloud, multiplier: float) -> o3d.geometry
 
 def preprocess_pcd(pcd: o3d.geometry.PointCloud, cfg: RegistrationConfig) -> o3d.geometry.PointCloud:
     _require_open3d()
-    pcd = pcd.voxel_down_sample(cfg.voxel_size)
-    if len(pcd.points) == 0:
-        raise ValueError("Point cloud became empty after voxel downsampling.")
+    if cfg.voxel_size > 0:
+        pcd = pcd.voxel_down_sample(cfg.voxel_size)
+        if len(pcd.points) == 0:
+            raise ValueError("Point cloud became empty after voxel downsampling.")
 
     if cfg.iqr_multiplier > 0:
         pcd = _iqr_filter(pcd, cfg.iqr_multiplier)
         if len(pcd.points) == 0:
             raise ValueError("Point cloud became empty after IQR outlier removal.")
 
-    pcd, _ = pcd.remove_statistical_outlier(
-        nb_neighbors=cfg.outlier_nb_neighbors,
-        std_ratio=cfg.outlier_std_ratio,
-    )
-    if len(pcd.points) == 0:
-        raise ValueError("Point cloud became empty after statistical outlier removal.")
+    if cfg.outlier_nb_neighbors > 0 and cfg.outlier_std_ratio > 0:
+        pcd, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=cfg.outlier_nb_neighbors,
+            std_ratio=cfg.outlier_std_ratio,
+        )
+        if len(pcd.points) == 0:
+            raise ValueError("Point cloud became empty after statistical outlier removal.")
 
     if cfg.radius_outlier_radius > 0 and cfg.radius_outlier_min_neighbors > 0:
         pcd, _ = pcd.remove_radius_outlier(

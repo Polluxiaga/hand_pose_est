@@ -1,5907 +1,97 @@
 #!/usr/bin/env python3
-"""
-Post-Grasp In-Hand Pose Re-Estimation (抓取后手中物体位姿重估计)
-
-两种工作模式:
-  模式 1 (world): 提供 cam_to_base → 在 base 系下配准 → 直接输出新的 base 系 OBB
-  模式 2 (camera): 不提供 cam_to_base → 在相机系下配准 → 输出 T_slip (夹爪系滑动量)
-
-输入:
-  - 抓取前/后 手部双目图像 (左图 + 右图) + 内参 + baseline
-  - 深度由 S2M2 云端接口生成
-  - Mask 由 SAM3 自动分割
-
-启动:
-    cd GraspPipeline
-    python main_pose_in_hand.py                      # 默认 http://0.0.0.0:7880
-    python main_pose_in_hand.py --port 7881 --share
-"""
-
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
-import io
 import json
 import math
 import os
-import re
-import subprocess
-import sys
-import tempfile
 import time
 import traceback
-import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import cv2
 import numpy as np
-
-try:
-    import gradio as gr
-except ImportError:
-    gr = None  # type: ignore[assignment]
 
 try:
     import open3d as o3d
 except ImportError:
     o3d = None  # type: ignore[assignment]
 
-import logging
-import requests
-
-from main_pcd_fit_cam import (
-    fit_camera_primitive_from_points,
-    render_best_fit_overlay_image,
-    serialize_fit_result,
-    summarize_fit_result_lines,
-)
-from lightglue_match_core import (
-    LightGlueMatchConfig,
-    draw_lightglue_matches,
-    estimate_lightglue_init_transform,
+from match_geometry_core import projected_uv_to_mask
+from pcd_registration_core import (
+    CameraIntrinsics,
+    RegistrationConfig,
+    copy_pcd,
+    local_hypothesis_search,
+    refine_with_colored_icp,
+    refine_with_gicp,
+    visibility_aware_score,
 )
 from tapir_match_core import (
     TapirMatchConfig,
     draw_tapir_matches,
     estimate_tapir_init_transform,
 )
-from pcd_registration_core import (
-    CameraIntrinsics,
-    RegistrationConfig,
-    copy_pcd,
-    fpfh_ransac_initial_transform,
-    invert_transform,
-    local_hypothesis_search,
-    make_transform,
-    pca_initial_transform,
-    pca_initial_transform_candidates,
-    preprocess_pcd,
-    refine_with_colored_icp,
-    refine_with_gicp,
-    rgbd_to_pointcloud,
-    transform_points,
-    visibility_aware_score,
-)
 
-_log = logging.getLogger(__name__)
-
-DEFAULT_SAM3_URL = os.getenv(
-    "SAM3_SERVER_URL",
-    os.getenv("PLACEDOF_SAM3_URL", "http://101.132.143.105:5081"),
-).rstrip("/")
-DEFAULT_S2M2_URL = os.getenv(
-    "S2M2_API_URL",
-    os.getenv("PLACEDOF_S2M2_API_URL", "http://101.132.143.105:5056/api/process"),
-).rstrip("/")
-QWEN_DASHSCOPE_API_KEY = os.getenv("QWEN_DASHSCOPE_API_KEY", "sk-4a47da58c2e64a53bc7b94d0892016be")
-QWEN_GROUNDING_MODEL = os.getenv("QWEN_GROUNDING_MODEL", "qwen3-vl-30b-a3b-instruct")
-_DASHSCOPE_MULTIMODAL_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-
-
-# ============================================================================
-# Self-contained cloud service clients (S2M2 / SAM3 / Qwen)
-# ============================================================================
-
-def _call_s2m2_depth_api(
-    left_img_path: str, right_img_path: str,
-    fx: float, fy: float, cx: float, cy: float,
-    baseline: float, server_url: str = DEFAULT_S2M2_URL,
-) -> np.ndarray:
-    """Call S2M2 depth estimation. Returns depth/xyz_map numpy array."""
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-    K_str = " ".join(str(v) for row in K for v in row)
-    last_error = ""
-    max_attempts = 3
-    retry_statuses = {502, 503, 504}
-    for attempt in range(1, max_attempts + 1):
-        left_f = open(left_img_path, "rb")
-        right_f = open(right_img_path, "rb")
-        try:
-            resp = requests.post(
-                server_url,
-                files={"left_file": left_f, "right_file": right_f},
-                data={"K": K_str, "baseline": str(np.float32(baseline))},
-                timeout=600,
-            )
-        except requests.RequestException as exc:
-            resp = None
-            last_error = str(exc)
-        finally:
-            left_f.close()
-            right_f.close()
-
-        if resp is not None and resp.status_code == 200:
-            return np.load(io.BytesIO(resp.content))
-        if resp is not None:
-            last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
-            should_retry = resp.status_code in retry_statuses
-        else:
-            should_retry = True
-        if should_retry and attempt < max_attempts:
-            time.sleep(1.5 * attempt)
-            continue
-        break
-    raise RuntimeError(
-        f"S2M2 failed after {max_attempts} attempt(s) at {server_url}: {last_error}"
-    )
-
-
-def _call_sam3_segment_api(
-    image_base64: str,
-    box_prompt: list | None = None,
-    server_url: str = DEFAULT_SAM3_URL,
-) -> dict | None:
-    """Call SAM3 segmentation with a bbox prompt. Returns JSON dict or None."""
-    payload: dict = {"image": image_base64}
-    if box_prompt:
-        payload["box_prompt"] = box_prompt
-    if len(payload) < 2:
-        return None
-    try:
-        resp = requests.post(
-            f"{server_url}/segment", json=payload,
-            headers={"Content-Type": "application/json"}, timeout=60,
-        )
-        return resp.json() if resp.status_code == 200 else None
-    except Exception:
-        return None
-
-
-def _call_qwen_grounding_api(
-    image_b64: str, prompt: str,
-    img_width: int, img_height: int,
-) -> dict:
-    """Call Qwen VLM grounding to detect object bbox from a text prompt."""
-    find_prompt = (
-        f"Your task is to find {prompt} in the image, which should be on the table or some platform.\n"
-        "Note: \n"
-        "1. If color or texture is provided, you should carefully check the item that matches the description."
-        "2. Choose only ONE most likely item if you find multiple ones.\n"
-        "3. Strictly following the <OUTPUT FORMAT> in JSON format.\n"
-        "4. Do not consider the item that is far from the table or platform."
-        "5. If you cannot find the item, return <finished:true>."
-    )
-    messages = [
-        {"role": "system", "content": [{"text": "You are a helpful tracking assistant."}]},
-        {"role": "user", "content": [
-            {"text": "Perform a pick and place task in the given image. If the pick or place conditions are not met, return <finished:true>."},
-            {"image": f"data:image/jpeg;base64,{image_b64}", "min_pixels": 640*480, "max_pixels": 1280*960},
-            {"text": find_prompt},
-        ]},
-        {"role": "user", "content": [{"text": '<OUTPUT TEMPLATE>: {"bbox": [x1, y1, x2, y2]}'}]},
-    ]
-    try:
-        resp = requests.post(
-            _DASHSCOPE_MULTIMODAL_URL,
-            headers={"Authorization": f"Bearer {QWEN_DASHSCOPE_API_KEY}", "Content-Type": "application/json"},
-            json={"model": QWEN_GROUNDING_MODEL, "input": {"messages": messages}},
-            timeout=120,
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"DashScope [{resp.status_code}]: {resp.text[:300]}")
-        choices = resp.json().get("output", {}).get("choices", [])
-        if not choices:
-            raise RuntimeError("DashScope returned no choices")
-        msg_text = (choices[0].get("message", {}).get("content", [{}])[0].get("text", ""))
-        for i, line in enumerate(msg_text.splitlines()):
-            if line == "```json":
-                msg_text = "\n".join(msg_text.splitlines()[i+1:]).split("```")[0]
-                break
-        if "true" in msg_text:
-            return {"bbox": None, "qwen_status": "finished", "response": msg_text}
-        msg_json, _ = json.JSONDecoder().raw_decode(msg_text.strip())
-        x1, y1, x2, y2 = msg_json["bbox"]
-        x1, y1 = int(x1/1000*img_width), int(y1/1000*img_height)
-        x2, y2 = int(x2/1000*img_width), int(y2/1000*img_height)
-        return {"bbox": [x1, y1, x2, y2], "qwen_status": "success", "response": msg_text}
-    except Exception as e:
-        _log.error("Qwen grounding failed ('%s'): %s", prompt, e)
-        return {"bbox": None, "qwen_status": "error", "response": str(e)}
-
-CUSTOM_CSS = """
-.gradio-container { max-width: 1700px !important; margin: auto; }
-#app-title { text-align: center; padding: 10px 0 2px; }
-#app-title h1 { font-size: 1.5rem; font-weight: 700; color: #1a1a2e; }
-.summary-box textarea {
-    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace !important;
-    font-size: 0.82rem !important; line-height: 1.5 !important;
-}
-"""
-
-
-# ============================================================================
-# Data classes
-# ============================================================================
-
-@dataclass
-class OBBState:
-    center_base: np.ndarray
-    axes_base: np.ndarray
-    size_xyz: np.ndarray
-
-    def __post_init__(self) -> None:
-        self.center_base = np.asarray(self.center_base, dtype=np.float32).reshape(3)
-        self.axes_base = np.asarray(self.axes_base, dtype=np.float32).reshape(3, 3)
-        self.size_xyz = np.asarray(self.size_xyz, dtype=np.float32).reshape(3)
-
-    def copy(self) -> OBBState:
-        return OBBState(self.center_base.copy(), self.axes_base.copy(), self.size_xyz.copy())
-
-    def corners_world(self) -> np.ndarray:
-        half = 0.5 * self.size_xyz.astype(np.float64)
-        signs = np.array(
-            [[-1, -1, -1], [1, -1, -1], [-1, 1, -1], [1, 1, -1],
-             [-1, -1, 1], [1, -1, 1], [-1, 1, 1], [1, 1, 1]],
-            dtype=np.float64,
-        )
-        local = signs * half
-        return (local @ self.axes_base.astype(np.float64).T + self.center_base.astype(np.float64)).astype(np.float32)
-
-    def to_dict(self) -> dict:
-        return {
-            "center_base": self.center_base.tolist(),
-            "axes_base": self.axes_base.tolist(),
-            "size_xyz": self.size_xyz.tolist(),
-        }
+DEFAULT_DOF_MATCH_DIR = "dof_match"
+DEFAULT_OUTPUT_DIR = "dof_batch_results"
+DEFAULT_TAPIR_HOST = os.getenv("TAPIR_HOST", "192.168.20.212")
+DEFAULT_TAPIR_PORT = int(os.getenv("TAPIR_PORT", "19812"))
 
 
 @dataclass
 class ReEstimationResult:
     success: bool
-    mode: str  # "world" or "camera"
+    mode: str
     T_registration: np.ndarray
     T_slip: np.ndarray
-    old_obb: OBBState | None = None
-    new_obb: OBBState | None = None
-    debug: Dict[str, Any] = field(default_factory=dict)
+    debug: dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
 
 
-# ============================================================================
-# Utility functions
-# ============================================================================
-
-def _orthonormalize_axes(axes: np.ndarray) -> np.ndarray:
-    a = np.asarray(axes, dtype=np.float64).reshape(3, 3)
-    x = a[:, 0]
-    x = x / max(np.linalg.norm(x), 1e-12)
-    y = a[:, 1] - np.dot(a[:, 1], x) * x
-    y = y / max(np.linalg.norm(y), 1e-12)
-    z = np.cross(x, y)
-    z = z / max(np.linalg.norm(z), 1e-12)
-    return np.stack([x, y, z], axis=1).astype(np.float32)
-
-
-def apply_transform_to_obb(obb: OBBState, T: np.ndarray) -> OBBState:
-    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
-    R, t = T[:3, :3], T[:3, 3]
-    new_center = (R @ obb.center_base.astype(np.float64) + t).astype(np.float32)
-    new_axes = _orthonormalize_axes((R @ obb.axes_base.astype(np.float64)).astype(np.float32))
-    return OBBState(center_base=new_center, axes_base=new_axes, size_xyz=obb.size_xyz.copy())
-
-
-def compute_T_slip(
-    T_reg: np.ndarray,
-    T_wrist_to_ee: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Convert camera-frame registration result to object slip in gripper frame.
-
-    T_slip = T_wrist_to_ee @ T_reg @ T_wrist_to_ee^{-1}
-
-    If T_wrist_to_ee is None (unknown hand-eye calibration), T_slip = T_reg.
-    """
-    T_reg = np.asarray(T_reg, dtype=np.float64).reshape(4, 4)
-    if T_wrist_to_ee is None:
-        return T_reg.copy()
-    T_we = np.asarray(T_wrist_to_ee, dtype=np.float64).reshape(4, 4)
-    return T_we @ T_reg @ np.linalg.inv(T_we)
-
-
-def apply_slip_to_obb(
-    old_obb: OBBState,
-    T_slip: np.ndarray,
-    G_at_pick: np.ndarray,
-    G_current: np.ndarray,
-) -> OBBState:
-    """
-    Apply T_slip + gripper motion to recover OBB in base frame.
-
-    new_obb = G_current @ T_slip @ G_at_pick^{-1} @ old_obb
-    """
-    G_pick = np.asarray(G_at_pick, dtype=np.float64).reshape(4, 4)
-    G_curr = np.asarray(G_current, dtype=np.float64).reshape(4, 4)
-    T_full = G_curr @ np.asarray(T_slip, dtype=np.float64).reshape(4, 4) @ np.linalg.inv(G_pick)
-    return apply_transform_to_obb(old_obb, T_full)
-
-
-def _t_slip_frame_name(mode: str, T_wrist_to_ee: np.ndarray | None) -> str:
-    if T_wrist_to_ee is not None:
-        return "ee"
-    if mode == "world":
-        return "base"
-    return "camera"
-
-
-def _t_slip_axis_description(frame_name: str) -> str:
-    if frame_name == "camera":
-        return "camera axes: +x right, +y down, +z forward"
-    if frame_name == "ee":
-        return "ee/gripper axes: uses the axes defined by your T_wrist_to_ee"
-    if frame_name == "base":
-        return "base axes: uses the axes of the provided world/base frame"
-    return f"{frame_name} axes"
-
-
-def _t_slip_rotation_lines(
-    T_slip: np.ndarray,
-    frame_name: str,
-    compact: bool = False,
-) -> list[str]:
-    lines: list[str] = []
-    try:
-        from scipy.spatial.transform import Rotation
-
-        rot = Rotation.from_matrix(np.asarray(T_slip, dtype=np.float64)[:3, :3])
-        euler = rot.as_euler("xyz", degrees=True)
-        rotvec = rot.as_rotvec()
-        angle_deg = float(np.linalg.norm(rotvec) * 180.0 / np.pi)
-        if angle_deg > 1e-9:
-            axis = rotvec / max(np.linalg.norm(rotvec), 1e-12)
-        else:
-            axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-
-        if compact:
-            lines.append(
-                f"T_slip rot: Euler xyz extrinsic [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}]deg"
-            )
-            lines.append(f"T_slip frame: {_t_slip_axis_description(frame_name)}")
-            lines.append(f"Axis-angle: axis=[{axis[0]:.2f}, {axis[1]:.2f}, {axis[2]:.2f}], angle={angle_deg:.1f}deg")
-        else:
-            lines.append(f"  旋转(Euler xyz, extrinsic / fixed axes): [{euler[0]:.2f}, {euler[1]:.2f}, {euler[2]:.2f}] deg")
-            lines.append(f"  坐标轴: {_t_slip_axis_description(frame_name)}")
-            lines.append("  欧拉角转序: xyz, 即 Rx -> Ry -> Rz（等价矩阵写法 R = Rz @ Ry @ Rx）")
-            lines.append(f"  轴角(axis-angle): axis=[{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}], angle={angle_deg:.2f} deg")
-    except ImportError:
-        pass
-    return lines
-
-
-def _rot_axis_deg(axis: str, angle_deg: float) -> np.ndarray:
-    rad = np.deg2rad(float(angle_deg))
-    c, s = float(np.cos(rad)), float(np.sin(rad))
-    if axis == "x":
-        return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float64)
-    if axis == "y":
-        return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float64)
-    if axis == "z":
-        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
-    raise ValueError(f"Unsupported axis: {axis}")
-
-
-def _rotate_transform_about_src_centroid(
-    T_init: np.ndarray,
-    src_pts: np.ndarray,
-    axis: str = "z",
-    angle_deg: float = 180.0,
-) -> np.ndarray:
-    src_centroid = src_pts.mean(axis=0).astype(np.float64)
-    pivot = (T_init[:3, :3] @ src_centroid + T_init[:3, 3]).astype(np.float64)
-    dR = _rot_axis_deg(axis, angle_deg)
-    rotated_pivot = dR @ pivot
-    dT = make_transform(dR, pivot - rotated_pivot)
-    return dT @ T_init
-
-
-def _append_unique_init(
-    items: list[tuple[str, np.ndarray]],
-    name: str,
-    T: np.ndarray,
-    rot_tol: float = 1e-5,
-    trans_tol: float = 1e-6,
-) -> None:
-    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
-    for _, existing in items:
-        if (
-            np.linalg.norm(existing[:3, :3] - T[:3, :3]) <= rot_tol
-            and np.linalg.norm(existing[:3, 3] - T[:3, 3]) <= trans_tol
-        ):
-            return
-    items.append((name, T))
-
-
-INIT_METHOD_CHOICES = ("auto", "pca", "centroid", "shape", "silhouette", "fpfh", "lightglue", "tapir")
-
-
-def _normalize_init_candidate_mode(mode: str | None) -> str:
-    value = str(mode or "auto").strip().lower().replace("-", "_")
-    aliases = {
-        "all": "auto",
-        "competition": "auto",
-        "feature": "lightglue",
-        "feature_lightglue": "lightglue",
-        "lightglue_only": "lightglue",
-        "tapir_only": "tapir",
-        "pcd": "fpfh",
-        "pcd_fpfh": "fpfh",
-        "pcd_fpfh_ransac": "fpfh",
-        "ransac": "fpfh",
-    }
-    value = aliases.get(value, value)
-    if value not in INIT_METHOD_CHOICES:
-        raise ValueError(f"Unknown init method '{mode}'. Choose one of: {', '.join(INIT_METHOD_CHOICES)}")
-    return value
-
-
-def _display_init_name(name: Any) -> Any:
-    if not isinstance(name, str):
-        return name
-    return (
-        name
-        .replace("__lightglue_fallback_pca__", "lightglue(pca)")
-        .replace("__tapir_fallback_pca__", "tapir(pca)")
-        .replace("feature_lightglue", "lightglue")
-    )
-
-
-def _safe_artifact_stem(name: Any) -> str:
-    text = str(_display_init_name(name) or "unknown").strip()
-    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
-    safe = "_".join(part for part in safe.split("_") if part)
-    return safe or "unknown"
-
-
-def _sanitize_init_names_for_output(obj: Any) -> Any:
-    if isinstance(obj, str):
-        return _display_init_name(obj)
-    if isinstance(obj, dict):
-        return {key: _sanitize_init_names_for_output(value) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [_sanitize_init_names_for_output(value) for value in obj]
-    if isinstance(obj, tuple):
-        return [_sanitize_init_names_for_output(value) for value in obj]
-    return obj
-
-
-def _safe_normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    arr = np.asarray(v, dtype=np.float64).reshape(3)
-    n = float(np.linalg.norm(arr))
-    if not np.isfinite(n) or n <= eps:
-        return np.zeros(3, dtype=np.float64)
-    return arr / n
-
-
-def _robust_pca_frame(
-    points: np.ndarray,
-    *,
-    trim_quantile: float = 0.92,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    pts = pts[np.isfinite(pts).all(axis=1)]
-    if len(pts) < 3:
-        raise ValueError("Need at least 3 finite points for PCA frame init.")
-
-    median_center = np.median(pts, axis=0)
-    dists = np.linalg.norm(pts - median_center, axis=1)
-    if len(pts) >= 20:
-        keep_radius = float(np.percentile(dists, float(np.clip(trim_quantile, 0.50, 1.0)) * 100.0))
-        keep = dists <= max(keep_radius, 1e-9)
-        if int(keep.sum()) >= max(8, int(0.35 * len(pts))):
-            pts_fit = pts[keep]
-        else:
-            pts_fit = pts
-    else:
-        pts_fit = pts
-
-    center = pts_fit.mean(axis=0)
-    X = pts_fit - center
-    cov = (X.T @ X) / max(len(pts_fit) - 1, 1)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    order = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[order]
-    eigvecs = eigvecs[:, order]
-    if np.linalg.det(eigvecs) < 0:
-        eigvecs[:, 2] *= -1.0
-
-    info = {
-        "num_points": int(len(pts)),
-        "num_fit_points": int(len(pts_fit)),
-        "trim_quantile": float(trim_quantile),
-        "eigvals": [float(v) for v in eigvals],
-    }
-    return center.astype(np.float64), eigvecs.astype(np.float64), eigvals.astype(np.float64), info
-
-
-def _mean_pca_frame(points: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    pts = pts[np.isfinite(pts).all(axis=1)]
-    if len(pts) < 3:
-        raise ValueError("Need at least 3 finite points for PCA frame init.")
-    center = pts.mean(axis=0)
-    X = pts - center
-    cov = (X.T @ X) / max(len(pts) - 1, 1)
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    order = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[order]
-    eigvecs = eigvecs[:, order]
-    if np.linalg.det(eigvecs) < 0:
-        eigvecs[:, 2] *= -1.0
-    info = {
-        "num_points": int(len(pts)),
-        "num_fit_points": int(len(pts)),
-        "trim_quantile": 1.0,
-        "eigvals": [float(v) for v in eigvals],
-    }
-    return center.astype(np.float64), eigvecs.astype(np.float64), eigvals.astype(np.float64), info
-
-
-def _frame_axis_rotation_options() -> list[tuple[str, np.ndarray]]:
-    options: list[tuple[str, np.ndarray]] = []
-    perms = [
-        ("xyz", (0, 1, 2)),
-        ("xzy", (0, 2, 1)),
-        ("yxz", (1, 0, 2)),
-        ("yzx", (1, 2, 0)),
-        ("zxy", (2, 0, 1)),
-        ("zyx", (2, 1, 0)),
-    ]
-    signs = [
-        ("ppp", (1.0, 1.0, 1.0)),
-        ("pnn", (1.0, -1.0, -1.0)),
-        ("npn", (-1.0, 1.0, -1.0)),
-        ("nnp", (-1.0, -1.0, 1.0)),
-        ("npp", (-1.0, 1.0, 1.0)),
-        ("pnp", (1.0, -1.0, 1.0)),
-        ("ppn", (1.0, 1.0, -1.0)),
-        ("nnn", (-1.0, -1.0, -1.0)),
-    ]
-    for perm_name, perm in perms:
-        P = np.zeros((3, 3), dtype=np.float64)
-        for col, row in enumerate(perm):
-            P[row, col] = 1.0
-        for sign_name, sign in signs:
-            S = np.diag(np.asarray(sign, dtype=np.float64))
-            M = P @ S
-            if np.linalg.det(M) > 0.0:
-                options.append((f"{perm_name}_{sign_name}", M))
-    return options
-
-
-def _score_frame_init_transform(
-    src_pts: np.ndarray,
-    tgt_pts: np.ndarray,
-    T: np.ndarray,
-    *,
-    max_points: int = 2600,
-) -> float:
-    src = np.asarray(src_pts, dtype=np.float64).reshape(-1, 3)
-    tgt = np.asarray(tgt_pts, dtype=np.float64).reshape(-1, 3)
-    src = src[np.isfinite(src).all(axis=1)]
-    tgt = tgt[np.isfinite(tgt).all(axis=1)]
-    if len(src) == 0 or len(tgt) == 0:
-        return float("inf")
-    if len(src) > max_points:
-        src = src[np.linspace(0, len(src) - 1, max_points).astype(np.int64)]
-    if len(tgt) > max_points:
-        tgt = tgt[np.linspace(0, len(tgt) - 1, max_points).astype(np.int64)]
-    src_t = transform_points(src, np.asarray(T, dtype=np.float64).reshape(4, 4))
-    try:
-        from scipy.spatial import cKDTree
-
-        dists, _ = cKDTree(tgt).query(src_t, k=1)
-        finite = dists[np.isfinite(dists)]
-        if len(finite) == 0:
-            return float("inf")
-        return float(0.75 * np.mean(finite) + 0.25 * np.percentile(finite, 85.0))
-    except Exception:
-        diff = src_t[:, None, :] - tgt[None, :, :]
-        dists = np.sqrt(np.min(np.sum(diff * diff, axis=2), axis=1))
-        return float(np.mean(dists))
-
-
-def _build_frame_pca_init_candidates(
-    src_pts: np.ndarray,
-    tgt_pts: np.ndarray,
-    *,
-    max_candidates: int = 6,
-) -> tuple[list[tuple[str, np.ndarray]], list[Dict[str, Any]]]:
-    frame_builders = [
-        ("mean", _mean_pca_frame),
-        ("robust", _robust_pca_frame),
-    ]
-    frames: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]] = []
-    for label, builder in frame_builders:
-        c_s, R_s, eig_s, info_s = builder(src_pts)
-        c_t, R_t, eig_t, info_t = builder(tgt_pts)
-        frames.append((label, c_s, R_s, R_t, {
-            "source": info_s,
-            "target": info_t,
-            "source_eigvals": [float(v) for v in eig_s],
-            "target_eigvals": [float(v) for v in eig_t],
-            "target_center": c_t.tolist(),
-        }))
-
-    rows: list[Dict[str, Any]] = []
-    raw: list[tuple[str, np.ndarray, float, Dict[str, Any]]] = []
-    for frame_label, c_s, R_s, R_t, frame_info in frames:
-        c_t = np.asarray(frame_info["target_center"], dtype=np.float64)
-        for option_name, M in _frame_axis_rotation_options():
-            R = R_t @ M @ R_s.T
-            if np.linalg.det(R) < 0.0:
-                continue
-            t = c_t - R @ c_s
-            T = make_transform(R, t)
-            score = _score_frame_init_transform(src_pts, tgt_pts, T)
-            row = {
-                "frame": frame_label,
-                "axis_option": option_name,
-                "score": float(score),
-                "source": frame_info.get("source"),
-                "target": frame_info.get("target"),
-            }
-            rows.append(row)
-            raw.append((f"{frame_label}_{option_name}", T, score, row))
-
-    raw.sort(key=lambda item: item[2])
-    selected: list[tuple[str, np.ndarray]] = []
-    selected_rows: list[Dict[str, Any]] = []
-    for _, T, score, row in raw:
-        before_len = len(selected)
-        _append_unique_init(selected, f"pca_{len(selected)}", T, rot_tol=1e-4, trans_tol=1e-5)
-        if len(selected) > before_len:
-            selected_rows.append({**row, "candidate": selected[-1][0], "selected": True, "score": float(score)})
-        if len(selected) >= int(max_candidates):
-            break
-
-    if selected:
-        first_name, first_T = selected[0]
-        rz_name = f"{first_name}_rz180"
-        before_len = len(selected)
-        _append_unique_init(
-            selected,
-            rz_name,
-            _rotate_transform_about_src_centroid(first_T, src_pts, axis="z", angle_deg=180.0),
-            rot_tol=1e-4,
-            trans_tol=1e-5,
-        )
-        if len(selected) > before_len:
-            selected_rows.append({
-                "candidate": rz_name,
-                "frame": "derived",
-                "axis_option": "world_z_180",
-                "score": float(_score_frame_init_transform(src_pts, tgt_pts, selected[-1][1])),
-                "selected": True,
-            })
-
-    selected_names = {name for name, _ in selected}
-    diag_rows = selected_rows + [
-        {**row, "selected": False}
-        for row in sorted(rows, key=lambda item: item["score"])
-        if row.get("candidate") not in selected_names
-    ]
-    return selected, diag_rows[:24]
-
-
-def _shape_type_family(fit_type: str | None) -> str | None:
-    if fit_type in {"cylinder", "frustum"}:
-        return "elongated_solid"
-    if fit_type in {"bowl", "plate"}:
-        return "dish"
-    return fit_type
-
-
-def _shape_type_compatibility(src_type: str | None, tgt_type: str | None) -> float:
-    if not src_type or not tgt_type:
-        return 0.0
-    if src_type == tgt_type:
-        return 1.0
-    src_family = _shape_type_family(src_type)
-    tgt_family = _shape_type_family(tgt_type)
-    if src_family == tgt_family == "elongated_solid":
-        return 0.78
-    if src_family == tgt_family == "dish":
-        return 0.72
-    return 0.0
-
-
-def _shape_primitive_scale(fit_type: str | None, primitive: Any) -> float:
-    if primitive is None or fit_type is None:
-        return 0.0
-    if fit_type == "cuboid":
-        return float(np.max(np.asarray(primitive.size, dtype=np.float64)))
-    if fit_type == "cylinder":
-        return float(max(primitive.height, 2.0 * primitive.semi_major, 2.0 * primitive.semi_minor))
-    if fit_type == "frustum":
-        return float(max(
-            primitive.height,
-            2.0 * primitive.small_end_major,
-            2.0 * primitive.large_end_major,
-        ))
-    if fit_type == "bowl":
-        return float(max(2.0 * primitive.rim_major, primitive.depth))
-    if fit_type == "plate":
-        return float(max(2.0 * primitive.rim_major, primitive.depth))
-    return 0.0
-
-
-def _shape_fit_confidence(fit_result: Dict[str, Any] | None) -> float:
-    if not fit_result:
-        return 0.0
-    fit_type = fit_result.get("best_type")
-    primitive = fit_result.get("best_result")
-    if fit_type is None or primitive is None:
-        return 0.0
-
-    scale = max(_shape_primitive_scale(fit_type, primitive), 1e-4)
-    residual = float(getattr(primitive, "residual", 0.0))
-    residual_score = float(np.exp(-((residual / max(0.10 * scale, 0.0035)) ** 2)))
-
-    scores = fit_result.get("scores") or {}
-    best_score = float(scores.get(fit_type, residual))
-    others = [float(v) for k, v in scores.items() if k != fit_type]
-    if others:
-        second = min(others)
-        margin = max(second - best_score, 0.0) / max(second, 1e-6)
-        margin_score = float(np.clip(margin / 0.25, 0.0, 1.0))
-    else:
-        margin_score = 0.75
-    return float(np.clip(0.65 * residual_score + 0.35 * margin_score, 0.0, 1.0))
-
-
-def _shape_fit_variants(
-    fit_result: Dict[str, Any] | None,
-    rel_margin: float = 0.14,
-    abs_margin: float = 2.5e-4,
-    max_variants: int = 3,
-) -> list[Dict[str, Any]]:
-    if not fit_result:
-        return []
-    scores = fit_result.get("scores") or {}
-    all_results = fit_result.get("all_results") or {}
-    best_type = fit_result.get("best_type")
-    best_result = fit_result.get("best_result")
-    if best_type is None or best_result is None:
-        return []
-
-    if not scores:
-        variant = dict(fit_result)
-        variant["_variant_rank"] = 0
-        variant["_variant_score"] = float(getattr(best_result, "residual", 0.0))
-        variant["_variant_rel_gap"] = 0.0
-        variant["_variant_base_type"] = best_type
-        return [variant]
-
-    ordered = sorted(scores.items(), key=lambda kv: kv[1])
-    best_score = float(scores.get(best_type, ordered[0][1]))
-    variants: list[Dict[str, Any]] = []
-    for rank, (cand_type, score) in enumerate(ordered):
-        cand_result = all_results.get(cand_type)
-        if cand_result is None:
-            if cand_type == best_type:
-                cand_result = best_result
-            else:
-                continue
-        rel_gap = max(float(score) - best_score, 0.0) / max(float(score), 1e-8)
-        include = (
-            rank == 0
-            or float(score) <= best_score + abs_margin
-            or rel_gap <= rel_margin
-        )
-        if not include:
-            continue
-        variant = dict(fit_result)
-        variant["best_type"] = cand_type
-        variant["best_result"] = cand_result
-        variant["_variant_rank"] = rank
-        variant["_variant_score"] = float(score)
-        variant["_variant_rel_gap"] = float(rel_gap)
-        variant["_variant_base_type"] = best_type
-        variants.append(variant)
-        if len(variants) >= max_variants:
-            break
-
-    if not variants:
-        variant = dict(fit_result)
-        variant["_variant_rank"] = 0
-        variant["_variant_score"] = float(best_score)
-        variant["_variant_rel_gap"] = 0.0
-        variant["_variant_base_type"] = best_type
-        variants.append(variant)
-    return variants
-
-
-def _shape_variant_debug_entries(
-    variants: list[Dict[str, Any]],
-    T_frame: np.ndarray,
-    max_entries: int = 5,
-) -> list[Dict[str, Any]]:
-    rows: list[Dict[str, Any]] = []
-    for variant in variants[:max_entries]:
-        desc = _shape_fit_to_descriptor(variant, T_frame)
-        rows.append({
-            "type": variant.get("best_type"),
-            "base_type": variant.get("_variant_base_type", variant.get("best_type")),
-            "rank": int(variant.get("_variant_rank", 0)),
-            "residual": float(variant.get("_variant_score", 0.0)),
-            "relative_gap": float(variant.get("_variant_rel_gap", 0.0)),
-            "family": desc.get("family") if desc else None,
-            "confidence": float(desc.get("confidence", 0.0)) if desc else 0.0,
-            "scale": float(desc.get("scale", 0.0)) if desc else 0.0,
-        })
-    return rows
-
-
-def _select_effective_shape_pair(
-    src_fit: Dict[str, Any] | None,
-    tgt_fit: Dict[str, Any] | None,
-    T_src_frame: np.ndarray,
-    T_tgt_frame: np.ndarray,
-) -> tuple[Dict[str, Any] | None, Dict[str, Any] | None, Dict[str, Any] | None, Dict[str, Any] | None, Dict[str, Any]]:
-    info: Dict[str, Any] = {
-        "selection_mode": "inactive",
-        "selected": False,
-        "source_type": None,
-        "target_type": None,
-        "source_best_type": None,
-        "target_best_type": None,
-        "source_variant_rank": None,
-        "target_variant_rank": None,
-        "compatibility": 0.0,
-        "confidence": 0.0,
-        "scale_score": 0.0,
-        "pair_score": 0.0,
-        "source_variants": [],
-        "target_variants": [],
-        "candidate_pairs": [],
-    }
-    if src_fit is None or tgt_fit is None:
-        return src_fit, tgt_fit, None, None, info
-
-    src_variants = _shape_fit_variants(src_fit)
-    tgt_variants = _shape_fit_variants(tgt_fit)
-    if not src_variants or not tgt_variants:
-        return src_fit, tgt_fit, None, None, info
-    info["source_variants"] = _shape_variant_debug_entries(src_variants, T_src_frame)
-    info["target_variants"] = _shape_variant_debug_entries(tgt_variants, T_tgt_frame)
-
-    primary_src = src_variants[0]
-    primary_tgt = tgt_variants[0]
-    primary_src_desc = _shape_fit_to_descriptor(primary_src, T_src_frame)
-    primary_tgt_desc = _shape_fit_to_descriptor(primary_tgt, T_tgt_frame)
-    primary_compat = _shape_type_compatibility(primary_src.get("best_type"), primary_tgt.get("best_type"))
-    primary_conf = min(
-        float(primary_src_desc.get("confidence", 0.0)) if primary_src_desc else 0.0,
-        float(primary_tgt_desc.get("confidence", 0.0)) if primary_tgt_desc else 0.0,
-    )
-    if primary_compat > 0.0 and primary_conf >= 0.42 and primary_src_desc is not None and primary_tgt_desc is not None:
-        info.update({
-            "selection_mode": "primary_best",
-            "selected": True,
-            "source_type": primary_src.get("best_type"),
-            "target_type": primary_tgt.get("best_type"),
-            "source_best_type": src_fit.get("best_type"),
-            "target_best_type": tgt_fit.get("best_type"),
-            "source_variant_rank": primary_src.get("_variant_rank", 0),
-            "target_variant_rank": primary_tgt.get("_variant_rank", 0),
-            "compatibility": float(primary_compat),
-            "confidence": float(primary_conf),
-            "scale_score": 1.0,
-            "pair_score": float(primary_compat * primary_conf),
-        })
-        return primary_src, primary_tgt, primary_src_desc, primary_tgt_desc, info
-
-    best_pair: tuple[Any, ...] | None = None
-    best_pair_score = -1.0
-    pair_candidates: list[Dict[str, Any]] = []
-    for src_variant in src_variants:
-        src_desc = _shape_fit_to_descriptor(src_variant, T_src_frame)
-        if src_desc is None:
-            continue
-        for tgt_variant in tgt_variants:
-            tgt_desc = _shape_fit_to_descriptor(tgt_variant, T_tgt_frame)
-            if tgt_desc is None:
-                continue
-            compat = _shape_type_compatibility(src_variant.get("best_type"), tgt_variant.get("best_type"))
-            conf = min(
-                float(src_desc.get("confidence", 0.0)),
-                float(tgt_desc.get("confidence", 0.0)),
-            )
-            if compat <= 0.0 or conf < 0.42:
-                continue
-            src_scale = float(max(src_desc.get("scale", 0.0), 1e-6))
-            tgt_scale = float(max(tgt_desc.get("scale", 0.0), 1e-6))
-            scale_rel = abs(src_scale - tgt_scale) / max(src_scale, tgt_scale, 1e-6)
-            scale_score = float(np.exp(-((scale_rel / 0.35) ** 2)))
-            rank_penalty = max(0.72, 1.0 - 0.08 * (
-                float(src_variant.get("_variant_rank", 0)) + float(tgt_variant.get("_variant_rank", 0))
-            ))
-            family_bonus = 1.05 if src_desc.get("family") == tgt_desc.get("family") else 1.0
-            pair_score = float(compat * conf * scale_score * rank_penalty * family_bonus)
-            pair_candidates.append({
-                "source_type": src_variant.get("best_type"),
-                "target_type": tgt_variant.get("best_type"),
-                "source_variant_rank": int(src_variant.get("_variant_rank", 0)),
-                "target_variant_rank": int(tgt_variant.get("_variant_rank", 0)),
-                "compatibility": float(compat),
-                "confidence": float(conf),
-                "scale_score": float(scale_score),
-                "rank_penalty": float(rank_penalty),
-                "family_bonus": float(family_bonus),
-                "pair_score": float(pair_score),
-            })
-            if pair_score > best_pair_score:
-                best_pair_score = pair_score
-                best_pair = (src_variant, tgt_variant, src_desc, tgt_desc, compat, conf, scale_score, pair_score)
-
-    if pair_candidates:
-        info["candidate_pairs"] = sorted(pair_candidates, key=lambda row: row["pair_score"], reverse=True)[:6]
-
-    if best_pair is not None:
-        src_variant, tgt_variant, src_desc, tgt_desc, compat, conf, scale_score, pair_score = best_pair
-        info.update({
-            "selection_mode": "ambiguous_fallback",
-            "selected": True,
-            "source_type": src_variant.get("best_type"),
-            "target_type": tgt_variant.get("best_type"),
-            "source_best_type": src_fit.get("best_type"),
-            "target_best_type": tgt_fit.get("best_type"),
-            "source_variant_rank": src_variant.get("_variant_rank", 0),
-            "target_variant_rank": tgt_variant.get("_variant_rank", 0),
-            "compatibility": float(compat),
-            "confidence": float(conf),
-            "scale_score": float(scale_score),
-            "pair_score": float(pair_score),
-        })
-        return src_variant, tgt_variant, src_desc, tgt_desc, info
-
-    return primary_src, primary_tgt, primary_src_desc, primary_tgt_desc, info
-
-
-def _align_vectors_rotation(src_axis: np.ndarray, tgt_axis: np.ndarray) -> np.ndarray:
-    src = _safe_normalize(src_axis)
-    tgt = _safe_normalize(tgt_axis)
-    if np.linalg.norm(src) < 1e-8 or np.linalg.norm(tgt) < 1e-8:
-        return np.eye(3, dtype=np.float64)
-    cross = np.cross(src, tgt)
-    cross_norm = float(np.linalg.norm(cross))
-    dot = float(np.clip(np.dot(src, tgt), -1.0, 1.0))
-    if cross_norm <= 1e-8:
-        if dot > 0.0:
-            return np.eye(3, dtype=np.float64)
-        helper = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        if abs(src[0]) > 0.9:
-            helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        axis = _safe_normalize(np.cross(src, helper))
-        K = np.array([
-            [0.0, -axis[2], axis[1]],
-            [axis[2], 0.0, -axis[0]],
-            [-axis[1], axis[0], 0.0],
-        ], dtype=np.float64)
-        return np.eye(3, dtype=np.float64) + 2.0 * (K @ K)
-
-    axis = cross / cross_norm
-    K = np.array([
-        [0.0, -axis[2], axis[1]],
-        [axis[2], 0.0, -axis[0]],
-        [-axis[1], axis[0], 0.0],
-    ], dtype=np.float64)
-    return np.eye(3, dtype=np.float64) + np.sin(np.arccos(dot)) * K + (1.0 - dot) * (K @ K)
-
-
-def _shape_transform_point(pt: np.ndarray, T_cam_to_frame: np.ndarray) -> np.ndarray:
-    pt = np.asarray(pt, dtype=np.float64).reshape(3)
-    T = np.asarray(T_cam_to_frame, dtype=np.float64).reshape(4, 4)
-    return (T[:3, :3] @ pt + T[:3, 3]).astype(np.float64)
-
-
-def _shape_transform_rotation(R_cam: np.ndarray, T_cam_to_frame: np.ndarray) -> np.ndarray:
-    return np.asarray(T_cam_to_frame, dtype=np.float64)[:3, :3] @ np.asarray(R_cam, dtype=np.float64)
-
-
-def _shape_fit_to_descriptor(
-    fit_result: Dict[str, Any] | None,
-    T_cam_to_frame: np.ndarray,
-) -> Dict[str, Any] | None:
-    if not fit_result:
-        return None
-    fit_type = fit_result.get("best_type")
-    primitive = fit_result.get("best_result")
-    if fit_type is None or primitive is None:
-        return None
-
-    desc: Dict[str, Any] = {
-        "fit_type": fit_type,
-        "family": _shape_type_family(fit_type),
-        "confidence": _shape_fit_confidence(fit_result),
-        "rotation": None,
-        "axis": None,
-        "origin": None,
-        "endpoints": None,
-        "size_vec": None,
-        "family_origin": None,
-        "family_size_vec": None,
-        "scale": _shape_primitive_scale(fit_type, primitive),
-        "sign_ambiguous": False,
-        "rotation_reliable": False,
-    }
-
-    if fit_type == "cuboid":
-        size = np.asarray(primitive.size, dtype=np.float64)
-        order = np.argsort(size)
-        major_idx = int(order[-1])
-        desc["origin"] = _shape_transform_point(primitive.center, T_cam_to_frame)
-        desc["family_origin"] = desc["origin"]
-        desc["size_vec"] = size
-        desc["family_size_vec"] = size
-        sorted_size = np.sort(size)
-        major_axis_distinct = bool((sorted_size[-1] - sorted_size[-2]) / max(sorted_size[-1], 1e-8) > 0.12)
-        if major_axis_distinct:
-            desc["axis"] = _safe_normalize(_shape_transform_rotation(primitive.rotation[:, major_idx], T_cam_to_frame))
-        desc["rotation_reliable"] = bool((sorted_size[-1] - sorted_size[0]) / max(sorted_size[-1], 1e-8) > 0.18)
-        if desc["rotation_reliable"]:
-            desc["rotation"] = _shape_transform_rotation(primitive.rotation, T_cam_to_frame)
-        desc["sign_ambiguous"] = True
-        if not major_axis_distinct:
-            desc["confidence"] *= 0.7
-    elif fit_type == "cylinder":
-        desc["origin"] = _shape_transform_point(primitive.center, T_cam_to_frame)
-        desc["axis"] = _safe_normalize(_shape_transform_rotation(primitive.axis, T_cam_to_frame))
-        desc["endpoints"] = (
-            _shape_transform_point(primitive.bottom_center, T_cam_to_frame),
-            _shape_transform_point(primitive.top_center, T_cam_to_frame),
-        )
-        desc["size_vec"] = np.array([primitive.semi_major, primitive.semi_minor, primitive.height], dtype=np.float64)
-        desc["family_origin"] = desc["origin"]
-        desc["family_size_vec"] = np.array([
-            0.5 * (primitive.semi_major + primitive.semi_minor),
-            primitive.height,
-        ], dtype=np.float64)
-        ratio = float(primitive.semi_major / max(primitive.semi_minor, 1e-8))
-        desc["rotation_reliable"] = bool(ratio > 1.15)
-        if desc["rotation_reliable"]:
-            desc["rotation"] = _shape_transform_rotation(primitive.rotation, T_cam_to_frame)
-        desc["sign_ambiguous"] = True
-    elif fit_type == "frustum":
-        small_center = _shape_transform_point(primitive.small_end_center, T_cam_to_frame)
-        large_center = _shape_transform_point(primitive.large_end_center, T_cam_to_frame)
-        center_mid = 0.5 * (small_center + large_center)
-        desc["origin"] = center_mid
-        desc["axis"] = _safe_normalize(_shape_transform_rotation(primitive.axis, T_cam_to_frame))
-        desc["endpoints"] = (
-            small_center,
-            large_center,
-        )
-        desc["size_vec"] = np.array([
-            primitive.small_end_major,
-            primitive.small_end_minor,
-            primitive.large_end_major,
-            primitive.large_end_minor,
-            primitive.height,
-        ], dtype=np.float64)
-        desc["family_origin"] = center_mid
-        desc["family_size_vec"] = np.array([
-            0.25 * (
-                primitive.small_end_major + primitive.small_end_minor +
-                primitive.large_end_major + primitive.large_end_minor
-            ),
-            primitive.height,
-        ], dtype=np.float64)
-        round_ratio = max(
-            primitive.small_end_major / max(primitive.small_end_minor, 1e-8),
-            primitive.large_end_major / max(primitive.large_end_minor, 1e-8),
-        )
-        desc["rotation_reliable"] = bool(round_ratio > 1.08)
-        if desc["rotation_reliable"]:
-            desc["rotation"] = _shape_transform_rotation(primitive.rotation, T_cam_to_frame)
-    elif fit_type == "bowl":
-        desc["origin"] = _shape_transform_point(primitive.vertex, T_cam_to_frame)
-        desc["family_origin"] = desc["origin"]
-        desc["axis"] = _safe_normalize(_shape_transform_rotation(primitive.axis, T_cam_to_frame))
-        desc["endpoints"] = (
-            _shape_transform_point(primitive.vertex, T_cam_to_frame),
-            _shape_transform_point(primitive.rim_center, T_cam_to_frame),
-        )
-        desc["size_vec"] = np.array([primitive.rim_major, primitive.rim_minor, primitive.depth], dtype=np.float64)
-        desc["family_size_vec"] = desc["size_vec"]
-        ratio = float(primitive.rim_major / max(primitive.rim_minor, 1e-8))
-        desc["rotation_reliable"] = bool(ratio > 1.08)
-        if desc["rotation_reliable"]:
-            desc["rotation"] = _shape_transform_rotation(primitive.rotation, T_cam_to_frame)
-    elif fit_type == "plate":
-        desc["origin"] = _shape_transform_point(primitive.vertex, T_cam_to_frame)
-        desc["family_origin"] = desc["origin"]
-        desc["axis"] = _safe_normalize(_shape_transform_rotation(primitive.axis, T_cam_to_frame))
-        desc["endpoints"] = (
-            _shape_transform_point(primitive.vertex, T_cam_to_frame),
-            _shape_transform_point(primitive.rim_center, T_cam_to_frame),
-        )
-        desc["size_vec"] = np.array([
-            primitive.bottom_major,
-            primitive.bottom_minor,
-            primitive.rim_major,
-            primitive.rim_minor,
-            primitive.depth,
-        ], dtype=np.float64)
-        desc["family_size_vec"] = np.array([
-            0.5 * (primitive.rim_major + primitive.rim_minor),
-            primitive.depth,
-        ], dtype=np.float64)
-        ratio = float(primitive.rim_major / max(primitive.rim_minor, 1e-8))
-        desc["rotation_reliable"] = bool(ratio > 1.08)
-        if desc["rotation_reliable"]:
-            desc["rotation"] = _shape_transform_rotation(primitive.rotation, T_cam_to_frame)
-
-    if desc["origin"] is None or desc["scale"] <= 1e-6:
-        return None
-    if desc.get("family_origin") is None:
-        desc["family_origin"] = desc["origin"]
-    if desc.get("family_size_vec") is None:
-        desc["family_size_vec"] = desc["size_vec"]
-    return desc
-
-
-def _build_shape_init_candidates(
-    src_desc: Dict[str, Any] | None,
-    tgt_desc: Dict[str, Any] | None,
-) -> list[tuple[str, np.ndarray]]:
-    if src_desc is None or tgt_desc is None:
-        return []
-    compat = _shape_type_compatibility(src_desc.get("fit_type"), tgt_desc.get("fit_type"))
-    conf = min(float(src_desc.get("confidence", 0.0)), float(tgt_desc.get("confidence", 0.0)))
-    if compat <= 0.0 or conf < 0.42:
-        return []
-
-    items: list[tuple[str, np.ndarray]] = []
-    if src_desc.get("family") == tgt_desc.get("family") == "elongated_solid":
-        src_origin = np.asarray(src_desc.get("family_origin", src_desc["origin"]), dtype=np.float64)
-        tgt_origin = np.asarray(tgt_desc.get("family_origin", tgt_desc["origin"]), dtype=np.float64)
-    else:
-        src_origin = np.asarray(src_desc["origin"], dtype=np.float64)
-        tgt_origin = np.asarray(tgt_desc["origin"], dtype=np.float64)
-
-    if (
-        src_desc.get("rotation") is not None
-        and tgt_desc.get("rotation") is not None
-        and src_desc.get("rotation_reliable")
-        and tgt_desc.get("rotation_reliable")
-    ):
-        src_R = np.asarray(src_desc["rotation"], dtype=np.float64)
-        tgt_R = np.asarray(tgt_desc["rotation"], dtype=np.float64)
-        src_type = src_desc.get("fit_type")
-        tgt_type = tgt_desc.get("fit_type")
-        if src_type == tgt_type == "cuboid":
-            # Cuboids keep a full PCA frame, but their axes have sign ambiguity.
-            # Enumerate the handedness-preserving sign flips so box-like objects
-            # can still inject strong orientation initials without overcommitting.
-            sign_options = (
-                np.diag([1.0, 1.0, 1.0]),
-                np.diag([1.0, -1.0, -1.0]),
-                np.diag([-1.0, 1.0, -1.0]),
-                np.diag([-1.0, -1.0, 1.0]),
-            )
-            for idx, sign_flip in enumerate(sign_options):
-                R = tgt_R @ sign_flip @ src_R.T
-                T = make_transform(R, tgt_origin - R @ src_origin)
-                _append_unique_init(items, f"shape_cuboid_full_{idx}", T)
-        elif (
-            src_type in {"frustum", "bowl", "plate"}
-            and tgt_type in {"frustum", "bowl", "plate"}
-        ):
-            R = tgt_R @ src_R.T
-            T = make_transform(R, tgt_origin - R @ src_origin)
-            _append_unique_init(items, f"shape_{src_type}_full", T)
-
-    if src_desc.get("axis") is not None and tgt_desc.get("axis") is not None:
-        R_axis = _align_vectors_rotation(np.asarray(src_desc["axis"], dtype=np.float64), np.asarray(tgt_desc["axis"], dtype=np.float64))
-        T_axis = make_transform(R_axis, tgt_origin - R_axis @ src_origin)
-        _append_unique_init(items, f"shape_{src_desc['fit_type']}_axis", T_axis)
-
-        if bool(src_desc.get("sign_ambiguous")) or bool(tgt_desc.get("sign_ambiguous")):
-            R_flip = _align_vectors_rotation(np.asarray(src_desc["axis"], dtype=np.float64), -np.asarray(tgt_desc["axis"], dtype=np.float64))
-            T_flip = make_transform(R_flip, tgt_origin - R_flip @ src_origin)
-            _append_unique_init(items, f"shape_{src_desc['fit_type']}_axis_flip", T_flip)
-
-    return items
-
-def _shape_similarity_score(
-    src_desc: Dict[str, Any] | None,
-    tgt_desc: Dict[str, Any] | None,
-    T_src_to_tgt: np.ndarray,
-    relation_info: Dict[str, Any] | None = None,
-) -> Dict[str, float]:
-    out = {
-        "enabled": False,
-        "score": 0.0,
-        "weight": 0.0,
-        "confidence": 0.0,
-        "compatibility": 0.0,
-        "center_score": 0.0,
-        "axis_score": 0.0,
-        "size_score": 0.0,
-        "endpoint_score": 0.0,
-        "rotation_score": 0.0,
-        "relation_score": 0.0,
-    }
-    if src_desc is None or tgt_desc is None:
-        return out
-
-    compat = _shape_type_compatibility(src_desc.get("fit_type"), tgt_desc.get("fit_type"))
-    conf = min(float(src_desc.get("confidence", 0.0)), float(tgt_desc.get("confidence", 0.0)))
-    if compat <= 0.0 or conf < 0.42:
-        return out
-
-    T = np.asarray(T_src_to_tgt, dtype=np.float64).reshape(4, 4)
-    scale = max(float(max(src_desc.get("scale", 0.0), tgt_desc.get("scale", 0.0))), 1e-4)
-    if src_desc.get("family") == tgt_desc.get("family") == "elongated_solid":
-        origin_src = np.asarray(src_desc.get("family_origin", src_desc["origin"]), dtype=np.float64)
-        origin_tgt = np.asarray(tgt_desc.get("family_origin", tgt_desc["origin"]), dtype=np.float64)
-    else:
-        origin_src = np.asarray(src_desc["origin"], dtype=np.float64)
-        origin_tgt = np.asarray(tgt_desc["origin"], dtype=np.float64)
-    origin_src_t = T[:3, :3] @ origin_src + T[:3, 3]
-    center_err = float(np.linalg.norm(origin_src_t - origin_tgt))
-    center_score = float(np.exp(-((center_err / max(0.22 * scale, 0.010)) ** 2)))
-
-    axis_score = 0.0
-    if src_desc.get("axis") is not None and tgt_desc.get("axis") is not None:
-        axis_src_t = _safe_normalize(T[:3, :3] @ np.asarray(src_desc["axis"], dtype=np.float64))
-        axis_tgt = _safe_normalize(np.asarray(tgt_desc["axis"], dtype=np.float64))
-        dot = float(np.clip(np.dot(axis_src_t, axis_tgt), -1.0, 1.0))
-        if bool(src_desc.get("sign_ambiguous")) or bool(tgt_desc.get("sign_ambiguous")):
-            axis_score = abs(dot)
-        else:
-            axis_score = max(dot, 0.0)
-
-    size_score = 0.0
-    if src_desc.get("family") == tgt_desc.get("family") == "elongated_solid":
-        src_size = src_desc.get("family_size_vec")
-        tgt_size = tgt_desc.get("family_size_vec")
-    else:
-        src_size = src_desc.get("size_vec")
-        tgt_size = tgt_desc.get("size_vec")
-    if src_size is not None and tgt_size is not None and len(src_size) == len(tgt_size):
-        src_size = np.asarray(src_size, dtype=np.float64)
-        tgt_size = np.asarray(tgt_size, dtype=np.float64)
-        rel = np.abs(src_size - tgt_size) / np.maximum(np.maximum(src_size, tgt_size), 1e-6)
-        size_score = float(np.exp(-((float(np.mean(rel)) / 0.30) ** 2)))
-
-    endpoint_score = 0.0
-    if src_desc.get("endpoints") is not None and tgt_desc.get("endpoints") is not None:
-        src_ep = np.asarray(src_desc["endpoints"], dtype=np.float64)
-        tgt_ep = np.asarray(tgt_desc["endpoints"], dtype=np.float64)
-        src_ep_t = (T[:3, :3] @ src_ep.T).T + T[:3, 3]
-        if relation_info and relation_info.get("available"):
-            if relation_info.get("preferred_relation") == "reversed":
-                tgt_ep_cmp = tgt_ep[::-1]
-            else:
-                tgt_ep_cmp = tgt_ep
-            ep_err = float(np.mean(np.linalg.norm(src_ep_t - tgt_ep_cmp, axis=1)))
-            endpoint_score = float(np.exp(-((ep_err / max(0.16 * scale, 0.010)) ** 2)))
-        elif not bool(src_desc.get("sign_ambiguous")) and not bool(tgt_desc.get("sign_ambiguous")):
-            ep_err = float(np.mean(np.linalg.norm(src_ep_t - tgt_ep, axis=1)))
-            endpoint_score = float(np.exp(-((ep_err / max(0.18 * scale, 0.010)) ** 2)))
-
-    rotation_score = 0.0
-    if (
-        src_desc.get("rotation") is not None
-        and tgt_desc.get("rotation") is not None
-        and src_desc.get("rotation_reliable")
-        and tgt_desc.get("rotation_reliable")
-        and not bool(src_desc.get("sign_ambiguous"))
-        and not bool(tgt_desc.get("sign_ambiguous"))
-    ):
-        R_src_t = T[:3, :3] @ np.asarray(src_desc["rotation"], dtype=np.float64)
-        R_tgt = np.asarray(tgt_desc["rotation"], dtype=np.float64)
-        dR = R_tgt.T @ R_src_t
-        angle = float(np.arccos(np.clip((np.trace(dR) - 1.0) * 0.5, -1.0, 1.0)))
-        rotation_score = float(np.exp(-((angle / np.deg2rad(35.0)) ** 2)))
-
-    relation_score = 0.0
-    if relation_info and relation_info.get("available") and src_desc.get("axis") is not None and tgt_desc.get("axis") is not None:
-        axis_src_t = _safe_normalize(T[:3, :3] @ np.asarray(src_desc["axis"], dtype=np.float64))
-        axis_tgt = _safe_normalize(np.asarray(tgt_desc["axis"], dtype=np.float64))
-        dot = float(np.clip(np.dot(axis_src_t, axis_tgt), -1.0, 1.0))
-        if relation_info.get("preferred_relation") == "reversed":
-            relation_score = float(np.clip((1.0 - dot) * 0.5, 0.0, 1.0))
-        else:
-            relation_score = float(np.clip((1.0 + dot) * 0.5, 0.0, 1.0))
-
-    parts = []
-    weights = []
-    for score_name, weight in (
-        (center_score, 0.30),
-        (axis_score, 0.25 if axis_score > 0.0 else 0.0),
-        (size_score, 0.20 if size_score > 0.0 else 0.0),
-        (endpoint_score, 0.15 if endpoint_score > 0.0 else 0.0),
-        (rotation_score, 0.10 if rotation_score > 0.0 else 0.0),
-        (relation_score, 0.20 * float(np.clip(relation_info.get("confidence", 0.0), 0.0, 1.0)) if relation_info and relation_score > 0.0 else 0.0),
-    ):
-        if weight > 0.0:
-            parts.append(score_name)
-            weights.append(weight)
-    geom_score = 0.0 if not weights else float(np.average(parts, weights=weights))
-    weight = float(min(0.22, 0.22 * compat * conf))
-
-    out.update({
-        "enabled": True,
-        "score": geom_score,
-        "weight": weight,
-        "confidence": conf,
-        "compatibility": compat,
-        "center_score": center_score,
-        "axis_score": axis_score,
-        "size_score": size_score,
-        "endpoint_score": endpoint_score,
-        "rotation_score": rotation_score,
-        "relation_score": relation_score,
-    })
-    return out
-
-
-def _camera_fit_endpoints(fit_result: Dict[str, Any] | None) -> np.ndarray | None:
-    if not fit_result:
-        return None
-    fit_type = fit_result.get("best_type")
-    primitive = fit_result.get("best_result")
-    if primitive is None:
-        return None
-    if fit_type == "cylinder":
-        return np.vstack([
-            np.asarray(primitive.bottom_center, dtype=np.float64),
-            np.asarray(primitive.top_center, dtype=np.float64),
-        ])
-    if fit_type == "frustum":
-        return np.vstack([
-            np.asarray(primitive.small_end_center, dtype=np.float64),
-            np.asarray(primitive.large_end_center, dtype=np.float64),
-        ])
-    return None
-
-
-def _project_points_to_image_float(
-    pts_xyz: np.ndarray,
-    intr: CameraIntrinsics,
-    image_hw: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
-    pts = np.asarray(pts_xyz, dtype=np.float64).reshape(-1, 3)
-    if len(pts) == 0:
-        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=bool)
-    z = pts[:, 2]
-    valid = np.isfinite(z) & (z > 1e-4)
-    uv = np.zeros((len(pts), 2), dtype=np.float64)
-    if valid.any():
-        uv_valid = np.column_stack([
-            pts[valid, 0] * intr.fx / z[valid] + intr.cx,
-            pts[valid, 1] * intr.fy / z[valid] + intr.cy,
-        ])
-        uv[valid] = uv_valid
-        h, w = image_hw
-        valid &= (
-            (uv[:, 0] >= 0.0) & (uv[:, 0] < float(w)) &
-            (uv[:, 1] >= 0.0) & (uv[:, 1] < float(h))
-        )
-    return uv, valid
-
-
-def _axis_profile_signature(
-    image_rgb: np.ndarray,
-    mask: np.ndarray,
-    depth_m: np.ndarray | None,
-    intr: CameraIntrinsics,
-    endpoints_cam: np.ndarray | None,
-    bins: int = 9,
-) -> Dict[str, Any] | None:
-    if endpoints_cam is None:
-        return None
-    uv, valid = _project_points_to_image_float(endpoints_cam, intr, image_rgb.shape[:2])
-    if len(uv) != 2 or not bool(np.all(valid)):
-        return None
-
-    start_uv = uv[0]
-    end_uv = uv[1]
-    axis_2d = end_uv - start_uv
-    axis_len = float(np.linalg.norm(axis_2d))
-    if not np.isfinite(axis_len) or axis_len < 28.0:
-        return None
-    axis_dir = axis_2d / axis_len
-    perp_dir = np.array([-axis_dir[1], axis_dir[0]], dtype=np.float64)
-
-    m = np.asarray(mask) > 0
-    if m.ndim == 3:
-        m = m[:, :, 0]
-    ys, xs = np.nonzero(m)
-    if len(xs) < 80:
-        return None
-
-    pixels = np.column_stack([xs, ys]).astype(np.float64)
-    rel = pixels - start_uv
-    t = (rel @ axis_dir) / axis_len
-    d = rel @ perp_dir
-    valid_px = np.isfinite(t) & np.isfinite(d) & (t >= -0.06) & (t <= 1.06)
-    if int(valid_px.sum()) < 80:
-        return None
-
-    pixels = pixels[valid_px]
-    xs = xs[valid_px]
-    ys = ys[valid_px]
-    t = t[valid_px]
-    d = d[valid_px]
-
-    lab_img = cv2.cvtColor(np.asarray(image_rgb, dtype=np.uint8), cv2.COLOR_RGB2LAB)
-    colors = lab_img[ys, xs].astype(np.float64)
-    if depth_m is not None:
-        depths = np.asarray(depth_m, dtype=np.float64)[ys, xs]
-    else:
-        depths = np.zeros(len(xs), dtype=np.float64)
-
-    features = []
-    counts = []
-    width_ref = max(float(np.percentile(np.abs(d), 95.0) * 2.0), 1.0)
-    depth_ref = depths[np.isfinite(depths) & (depths > 0)]
-    depth_mean = float(depth_ref.mean()) if len(depth_ref) > 0 else 0.0
-    depth_scale = max(float(depth_ref.std()) if len(depth_ref) > 5 else 0.0, 0.015)
-    edges = np.linspace(0.0, 1.0, bins + 1)
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        sel = (t >= lo) & (t < hi if hi < 1.0 else t <= hi)
-        count = int(sel.sum())
-        counts.append(count)
-        if count < 10:
-            features.append(np.zeros(6, dtype=np.float64))
-            continue
-        cols = colors[sel]
-        lab_mean = cols.mean(axis=0)
-        depth_sel = depths[sel]
-        valid_depth = depth_sel[np.isfinite(depth_sel) & (depth_sel > 0)]
-        depth_feature = 0.0 if len(valid_depth) == 0 else float((valid_depth.mean() - depth_mean) / depth_scale)
-        width_feature = float(np.percentile(np.abs(d[sel]), 90.0) * 2.0 / width_ref)
-        feat = np.array([
-            lab_mean[0] / 255.0,
-            (lab_mean[1] - 128.0) / 64.0,
-            (lab_mean[2] - 128.0) / 64.0,
-            np.clip(depth_feature, -2.0, 2.0) / 2.0,
-            np.clip(width_feature, 0.0, 2.0) / 2.0,
-            np.clip(count / max(len(xs) / bins, 1.0), 0.0, 2.0) / 2.0,
-        ], dtype=np.float64)
-        features.append(feat)
-
-    feature_arr = np.vstack(features)
-    coverage = float(np.mean(np.asarray(counts) >= 10))
-    return {
-        "features": feature_arr,
-        "counts": counts,
-        "coverage": coverage,
-        "axis_len_px": axis_len,
-        "start_uv": start_uv.tolist(),
-        "end_uv": end_uv.tolist(),
-    }
-
-
-def _compare_axis_profile_signatures(
-    src_profile: Dict[str, Any] | None,
-    tgt_profile: Dict[str, Any] | None,
-) -> Dict[str, Any]:
-    out = {
-        "available": False,
-        "preferred_relation": "same",
-        "same_score": 0.0,
-        "reversed_score": 0.0,
-        "confidence": 0.0,
-    }
-    if not src_profile or not tgt_profile:
-        return out
-
-    src_feat = np.asarray(src_profile.get("features"), dtype=np.float64)
-    tgt_feat = np.asarray(tgt_profile.get("features"), dtype=np.float64)
-    if src_feat.shape != tgt_feat.shape or src_feat.ndim != 2 or src_feat.shape[0] < 4:
-        return out
-
-    coverage = min(float(src_profile.get("coverage", 0.0)), float(tgt_profile.get("coverage", 0.0)))
-    if coverage < 0.55:
-        return out
-
-    mse_same = float(np.mean((src_feat - tgt_feat) ** 2))
-    mse_rev = float(np.mean((src_feat - tgt_feat[::-1]) ** 2))
-    same_score = float(np.exp(-(mse_same / 0.08)))
-    reversed_score = float(np.exp(-(mse_rev / 0.08)))
-    pref = "reversed" if reversed_score > same_score else "same"
-    confidence = float(abs(reversed_score - same_score) * coverage)
-    out.update({
-        "available": True,
-        "preferred_relation": pref,
-        "same_score": same_score,
-        "reversed_score": reversed_score,
-        "confidence": confidence,
-        "coverage": coverage,
-    })
-    return out
-
-
-def _orthogonal_unit(v: np.ndarray) -> np.ndarray:
-    v = _safe_normalize(v)
-    if np.linalg.norm(v) < 1e-8:
-        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    helper = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    if abs(v[0]) > 0.9:
-        helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    ortho = np.cross(v, helper)
-    return _safe_normalize(ortho)
-
-
-def _axis_angle_rotation(axis: np.ndarray, angle_deg: float) -> np.ndarray:
-    axis = _safe_normalize(axis)
-    if np.linalg.norm(axis) < 1e-8:
-        return np.eye(3, dtype=np.float64)
-    rad = np.deg2rad(float(angle_deg))
-    c = float(np.cos(rad))
-    s = float(np.sin(rad))
-    x, y, z = axis
-    K = np.array([
-        [0.0, -z, y],
-        [z, 0.0, -x],
-        [-y, x, 0.0],
-    ], dtype=np.float64)
-    return np.eye(3, dtype=np.float64) + s * K + (1.0 - c) * (K @ K)
-
-
-def _rotate_transform_about_world_pivot(
-    T_init: np.ndarray,
-    pivot_world: np.ndarray,
-    axis_world: np.ndarray,
-    angle_deg: float = 180.0,
-) -> np.ndarray:
-    pivot = np.asarray(pivot_world, dtype=np.float64).reshape(3)
-    dR = _axis_angle_rotation(axis_world, angle_deg)
-    rotated_pivot = dR @ pivot
-    dT = make_transform(dR, pivot - rotated_pivot)
-    return dT @ np.asarray(T_init, dtype=np.float64).reshape(4, 4)
-
-
-def _projected_points_mask_score(
-    pts_src: np.ndarray,
-    T_src_to_tgt: np.ndarray,
-    target_mask: np.ndarray,
-    intr: CameraIntrinsics,
-    T_after_cam_to_frame: np.ndarray,
-    depth_ref: np.ndarray | None = None,
-    depth_tol_m: float = 0.04,
-    downsample: int = 4,
-) -> Dict[str, float]:
-    pts = np.asarray(pts_src, dtype=np.float64).reshape(-1, 3)
-    if len(pts) == 0:
-        return {"precision": 0.0, "recall": 0.0, "iou": 0.0, "f1": 0.0, "proj_area": 0.0}
-
-    pts_tgt = transform_points(pts, np.asarray(T_src_to_tgt, dtype=np.float64).reshape(4, 4))
-    T_frame_to_cam = invert_transform(np.asarray(T_after_cam_to_frame, dtype=np.float64).reshape(4, 4))
-    pts_cam = transform_points(pts_tgt, T_frame_to_cam)
-    uv = _project_points_to_image(
-        pts_cam,
-        intr,
-        target_mask.shape[:2],
-        depth_ref=depth_ref,
-        depth_tol_m=depth_tol_m,
-    )
-    if len(uv) == 0:
-        return {"precision": 0.0, "recall": 0.0, "iou": 0.0, "f1": 0.0, "proj_area": 0.0}
-
-    ds = max(1, int(downsample))
-    h, w = target_mask.shape[:2]
-    hs = max(1, (h + ds - 1) // ds)
-    ws = max(1, (w + ds - 1) // ds)
-    proj_mask = np.zeros((hs, ws), dtype=np.uint8)
-    uvs = np.column_stack([
-        np.clip(uv[:, 0] // ds, 0, ws - 1),
-        np.clip(uv[:, 1] // ds, 0, hs - 1),
-    ]).astype(np.int32)
-    proj_mask[uvs[:, 1], uvs[:, 0]] = 255
-    if len(uvs) >= 3:
-        hull = cv2.convexHull(uvs.reshape(-1, 1, 2))
-        cv2.fillConvexPoly(proj_mask, hull, 255)
-    proj_mask = cv2.dilate(proj_mask, np.ones((3, 3), np.uint8), iterations=1)
-
-    tgt_mask = (np.asarray(target_mask) > 0).astype(np.uint8)
-    if tgt_mask.ndim == 3:
-        tgt_mask = tgt_mask[:, :, 0]
-    if ds > 1:
-        tgt_mask = cv2.resize(tgt_mask, (ws, hs), interpolation=cv2.INTER_NEAREST)
-    tgt_mask = (tgt_mask > 0).astype(np.uint8)
-
-    proj_bool = proj_mask > 0
-    tgt_bool = tgt_mask > 0
-    overlap = int(np.count_nonzero(proj_bool & tgt_bool))
-    proj_area = int(np.count_nonzero(proj_bool))
-    tgt_area = int(np.count_nonzero(tgt_bool))
-    union = int(np.count_nonzero(proj_bool | tgt_bool))
-    precision = overlap / max(proj_area, 1)
-    recall = overlap / max(tgt_area, 1)
-    iou = overlap / max(union, 1)
-    f1 = 0.0 if (precision + recall) <= 1e-9 else (2.0 * precision * recall / (precision + recall))
-    return {
-        "precision": float(precision),
-        "recall": float(recall),
-        "iou": float(iou),
-        "f1": float(f1),
-        "proj_area": float(proj_area),
-    }
-
-
-def _build_silhouette_search_candidates(
-    src_pcd,
-    base_inits: list[tuple[str, np.ndarray]],
-    target_mask: np.ndarray,
-    intr: CameraIntrinsics,
-    T_after_cam_to_frame: np.ndarray,
-    depth_ref: np.ndarray | None,
-    shape_after_desc: Dict[str, Any] | None = None,
-    max_points: int = 1800,
-    max_base_inits: int = 12,
-    max_candidates: int = 6,
-    min_f1: float = 0.08,
-) -> tuple[list[tuple[str, np.ndarray]], list[Dict[str, Any]]]:
-    pts_src = np.asarray(src_pcd.points, dtype=np.float64)
-    if len(pts_src) == 0 or not base_inits:
-        return [], []
-    if len(pts_src) > int(max_points):
-        ids = np.linspace(0, len(pts_src) - 1, int(max_points)).astype(np.int64)
-        pts_score = pts_src[ids]
-    else:
-        pts_score = pts_src
-
-    src_center = pts_src.mean(axis=0)
-    coarse_axes: list[tuple[str, str, np.ndarray, tuple[float, ...]]] = []
-    sweep_axes: list[tuple[str, str, np.ndarray, tuple[float, ...]]] = []
-    cam_R = np.asarray(T_after_cam_to_frame, dtype=np.float64).reshape(4, 4)[:3, :3]
-    cam_z = _safe_normalize(cam_R @ np.array([0.0, 0.0, 1.0]))
-    coarse_axes.append(("coarse", "cam_z", cam_z, (-180.0, -135.0, -90.0, -45.0, 45.0, 90.0, 135.0, 180.0)))
-    sweep_angles = tuple(float(v) for v in range(-180, 181, 15) if v != 0)
-    sweep_axes.append(("sweep", "cam_z", cam_z, sweep_angles))
-    if shape_after_desc is not None and shape_after_desc.get("axis") is not None:
-        shape_axis = _safe_normalize(np.asarray(shape_after_desc["axis"], dtype=np.float64))
-        if np.linalg.norm(shape_axis) > 1e-8:
-            coarse_axes.append(("coarse", "shape_axis", shape_axis, (-180.0, -90.0, 90.0, 180.0)))
-            sweep_axes.append(("sweep", "shape_axis", shape_axis, (-180.0, -150.0, -120.0, -90.0, -60.0, -30.0, 30.0, 60.0, 90.0, 120.0, 150.0, 180.0)))
-
-    rows: list[Dict[str, Any]] = []
-    candidates: list[tuple[str, np.ndarray]] = []
-    seen_names: set[str] = set()
-    for base_name, T_base_raw in base_inits[: int(max_base_inits)]:
-        T_base = np.asarray(T_base_raw, dtype=np.float64).reshape(4, 4)
-        pivot = T_base[:3, :3] @ src_center + T_base[:3, 3]
-        score0 = _projected_points_mask_score(
-            pts_score, T_base, target_mask, intr, T_after_cam_to_frame, depth_ref=depth_ref,
-        )
-        rows.append({
-            "name": f"{base_name}_base",
-            "subtype": "base",
-            "base": base_name,
-            "axis": "none",
-            "angle_deg": 0.0,
-            **score0,
-            "pre_score": float(0.55 * score0["f1"] + 0.25 * score0["iou"] + 0.20 * score0["recall"]),
-            "selected": False,
-        })
-        base_local_axes = [
-            ("sweep", "base_x", _safe_normalize(T_base[:3, :3] @ np.array([1.0, 0.0, 0.0])), (-180.0, -120.0, -60.0, 60.0, 120.0, 180.0)),
-            ("sweep", "base_y", _safe_normalize(T_base[:3, :3] @ np.array([0.0, 1.0, 0.0])), (-180.0, -120.0, -60.0, 60.0, 120.0, 180.0)),
-            ("sweep", "base_z", _safe_normalize(T_base[:3, :3] @ np.array([0.0, 0.0, 1.0])), (-180.0, -120.0, -60.0, 60.0, 120.0, 180.0)),
-        ]
-        for subtype, axis_name, axis_vec, angles in [*coarse_axes, *sweep_axes, *base_local_axes]:
-            if np.linalg.norm(axis_vec) <= 1e-8:
-                continue
-            for angle in angles:
-                T_cand = _rotate_transform_about_world_pivot(T_base, pivot, axis_vec, angle_deg=angle)
-                sil = _projected_points_mask_score(
-                    pts_score, T_cand, target_mask, intr, T_after_cam_to_frame, depth_ref=depth_ref,
-                )
-                pre_score = float(0.55 * sil["f1"] + 0.25 * sil["iou"] + 0.20 * sil["recall"])
-                if subtype == "sweep":
-                    cand_name = f"silhouette_sweep_{base_name}_{axis_name}_{int(round(angle))}"
-                else:
-                    cand_name = f"silhouette_{base_name}_{axis_name}_{int(round(angle))}"
-                row = {
-                    "name": cand_name,
-                    "subtype": subtype,
-                    "base": base_name,
-                    "axis": axis_name,
-                    "angle_deg": float(angle),
-                    **sil,
-                    "pre_score": pre_score,
-                    "selected": False,
-                }
-                rows.append(row)
-                if sil["f1"] >= float(min_f1):
-                    candidates.append((cand_name, T_cand))
-
-    rows.sort(key=lambda row: row["pre_score"], reverse=True)
-    selected: list[tuple[str, np.ndarray]] = []
-    selected_names: set[str] = set()
-    by_name = {name: T for name, T in candidates}
-    for row in rows:
-        name = str(row["name"])
-        if name not in by_name or name in seen_names:
-            continue
-        T = by_name[name]
-        before_len = len(selected)
-        _append_unique_init(selected, name, T, rot_tol=1e-4, trans_tol=1e-5)
-        if len(selected) > before_len:
-            selected_names.add(name)
-            row["selected"] = True
-        seen_names.add(name)
-        if len(selected) >= int(max_candidates):
-            break
-
-    for row in rows:
-        row["selected"] = bool(row["name"] in selected_names)
-    return selected, rows[: min(len(rows), 48)]
-
-
-# ============================================================================
-# S2M2 stereo → depth
-# ============================================================================
-
-def call_s2m2_depth(
-    left_rgb: np.ndarray,
-    right_rgb: np.ndarray,
-    fx: float, fy: float, cx: float, cy: float,
-    baseline: float,
-    s2m2_url: str = DEFAULT_S2M2_URL,
-) -> np.ndarray:
-    """Call S2M2 cloud service to compute depth from a stereo pair."""
-    with tempfile.TemporaryDirectory(prefix="pose_inhand_s2m2_") as tmpdir:
-        left_path = os.path.join(tmpdir, "left.jpg")
-        right_path = os.path.join(tmpdir, "right.jpg")
-        cv2.imwrite(left_path, cv2.cvtColor(left_rgb, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(right_path, cv2.cvtColor(right_rgb, cv2.COLOR_RGB2BGR))
-        return _call_s2m2_depth_api(
-            left_img_path=left_path, right_img_path=right_path,
-            fx=float(fx), fy=float(fy), cx=float(cx), cy=float(cy),
-            baseline=float(baseline), server_url=s2m2_url,
-        )
-
-
-def depth_to_meters(depth_data: np.ndarray, target_hw: tuple | None = None) -> np.ndarray:
-    """
-    Convert S2M2 output to (H, W) float32 depth in meters.
-
-    S2M2 may return:
-      - (H, W, 3): xyz point cloud map → extract z channel
-      - (N, 3): unstructured point cloud → not handled here
-      - (H, W): already a depth map
-
-    If target_hw is given and sizes differ, resizes to match.
-    """
+@dataclass
+class SeedCandidate:
+    tag: str
+    T_init: np.ndarray
+    score_hint: float = 0.0
+    search_mode: str = "full"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _emit_runtime_log(log_fn, message: str) -> None:
+    if not callable(log_fn):
+        return
+    stamp = time.strftime("%H:%M:%S")
+    log_fn(f"[{stamp}] {message}")
+
+
+def depth_to_meters(depth_data: np.ndarray, target_hw: tuple[int, int] | None = None) -> np.ndarray:
     if depth_data.ndim == 3 and depth_data.shape[2] == 3:
-        d = depth_data[:, :, 2].astype(np.float32)
+        depth_m = depth_data[:, :, 2].astype(np.float32)
     elif depth_data.ndim == 2:
-        d = depth_data.astype(np.float32)
+        depth_m = depth_data.astype(np.float32)
     else:
         raise ValueError(f"Unsupported depth shape: {depth_data.shape}")
 
     if np.issubdtype(depth_data.dtype, np.integer):
-        d *= 0.001
+        depth_m *= 0.001
 
-    invalid = ~np.isfinite(d) | (d <= 0)
-    d[invalid] = 0.0
+    invalid = ~np.isfinite(depth_m) | (depth_m <= 0.0)
+    depth_m[invalid] = 0.0
 
     if target_hw is not None:
-        th, tw = target_hw
-        if d.shape[0] != th or d.shape[1] != tw:
-            d = cv2.resize(d, (tw, th), interpolation=cv2.INTER_NEAREST)
+        target_h, target_w = target_hw
+        if depth_m.shape[:2] != (target_h, target_w):
+            depth_m = cv2.resize(depth_m, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+    return depth_m
 
-    return d
-
-
-# ============================================================================
-# Qwen detection → SAM3 segmentation
-# ============================================================================
-
-def _qwen_detect_bbox(
-    rgb: np.ndarray,
-    text_prompt: str,
-) -> Dict[str, Any]:
-    """Call Qwen grounding VLM to detect object bbox from a text prompt."""
-    h, w = rgb.shape[:2]
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    _, buf = cv2.imencode(".jpg", bgr)
-    img_b64 = base64.b64encode(buf).decode("utf-8")
-    result = _call_qwen_grounding_api(img_b64, text_prompt, w, h)
-    return {
-        "bbox": result.get("bbox"),
-        "status": result.get("qwen_status", "error"),
-        "response": result.get("response", ""),
-    }
-
-
-def _sam3_mask_from_bbox(
-    rgb: np.ndarray,
-    bbox: list,
-    sam3_url: str = DEFAULT_SAM3_URL,
-) -> np.ndarray:
-    """Call SAM3 with a bbox prompt. Returns uint8 mask (0/255)."""
-    from PIL import Image as PILImage
-    h, w = rgb.shape[:2]
-    rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8) if rgb.dtype != np.uint8 else rgb
-    pil_img = PILImage.fromarray(rgb_u8)
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=92)
-    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-    result = _call_sam3_segment_api(
-        image_base64=img_b64, box_prompt=bbox,
-        server_url=sam3_url,
-    )
-    if not result or not result.get("success"):
-        raise RuntimeError(f"SAM3 failed: {result}")
-    detections = result.get("detections", [])
-    if not detections:
-        raise RuntimeError("SAM3 returned no detections")
-
-    mask_data = base64.b64decode(detections[0]["mask"])
-    mask_img = PILImage.open(io.BytesIO(mask_data)).convert("L")
-    if mask_img.size != (w, h):
-        mask_img = mask_img.resize((w, h), PILImage.Resampling.NEAREST)
-    return (np.array(mask_img) > 0).astype(np.uint8) * 255
-
-
-def detect_and_segment(
-    rgb: np.ndarray,
-    bbox: list | None = None,
-    text_prompt: str | None = None,
-    sam3_url: str = DEFAULT_SAM3_URL,
-) -> Tuple[np.ndarray, list | None, Dict[str, Any]]:
-    """
-    Full detection + segmentation pipeline.
-
-    Priority:
-      1. If bbox is given → SAM3 with bbox directly
-      2. If text_prompt is given → Qwen detection → get bbox → SAM3 with bbox
-      3. Neither → use center 60% of image as default bbox → SAM3
-
-    Returns: (mask_uint8, bbox_used, debug_info)
-    """
-    debug: Dict[str, Any] = {}
-    h, w = rgb.shape[:2]
-
-    if bbox is not None:
-        debug["source"] = "manual_bbox"
-    elif text_prompt:
-        debug["source"] = "qwen_detection"
-        qwen_result = _qwen_detect_bbox(rgb, text_prompt)
-        debug["qwen_status"] = qwen_result["status"]
-        debug["qwen_response"] = qwen_result["response"][:200]
-        if qwen_result["bbox"] is not None:
-            bbox = qwen_result["bbox"]
-            debug["qwen_bbox"] = bbox
-        else:
-            raise RuntimeError(
-                f"Qwen 检测失败 ('{text_prompt}'): {qwen_result['status']} — {qwen_result['response'][:100]}"
-            )
-    else:
-        debug["source"] = "default_center_bbox"
-        margin_x, margin_y = int(w * 0.2), int(h * 0.2)
-        bbox = [margin_x, margin_y, w - margin_x, h - margin_y]
-
-    debug["bbox_used"] = bbox
-    mask = _sam3_mask_from_bbox(rgb, bbox, sam3_url=sam3_url)
-    debug["mask_area_px"] = int(np.count_nonzero(mask))
-    return mask, bbox, debug
-
-
-# ============================================================================
-# Coarse-to-fine registration
-# ============================================================================
-
-def coarse_fine_registration(
-    src_pcd, tgt_pcd,
-    T_init: np.ndarray,
-    after_depth_m: np.ndarray,
-    after_rgb: np.ndarray,
-    after_intr: CameraIntrinsics,
-    T_after_cam_to_frame: np.ndarray,
-    cfg: RegistrationConfig,
-    use_coarse_fine: bool = True,
-) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """Two-stage hypothesis search + ICP refinement."""
-    debug: Dict[str, Any] = {}
-    t0 = time.perf_counter()
-
-    if use_coarse_fine:
-        coarse_cfg = replace(cfg,
-            search_rx_deg=(-60.0, -30.0, 0.0, 30.0, 60.0),
-            search_ry_deg=(-60.0, -30.0, 0.0, 30.0, 60.0),
-            search_rz_deg=(-180.0, -135.0, -90.0, -45.0, 0.0, 45.0, 90.0, 135.0, 180.0),
-            search_tx_m=(-0.025, 0.0, 0.025),
-            search_ty_m=(-0.025, 0.0, 0.025),
-            search_tz_m=(-0.025, 0.0, 0.025),
-        )
-        T_coarse, coarse_info = local_hypothesis_search(
-            src_head_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_init=T_init,
-            wrist_depth_m=after_depth_m, wrist_rgb=after_rgb,
-            wrist_intr=after_intr, T_wrist_to_base=T_after_cam_to_frame,
-            cfg=coarse_cfg,
-        )
-        debug["coarse_score"] = coarse_info.get("score", -1e9)
-        debug["coarse_ms"] = int((time.perf_counter() - t0) * 1000)
-
-        t1 = time.perf_counter()
-        fine_cfg = replace(cfg,
-            search_rx_deg=(-10.0, -5.0, 0.0, 5.0, 10.0),
-            search_ry_deg=(-10.0, -5.0, 0.0, 5.0, 10.0),
-            search_rz_deg=(-15.0, -7.0, 0.0, 7.0, 15.0),
-            search_tx_m=(-0.005, 0.0, 0.005),
-            search_ty_m=(-0.005, 0.0, 0.005),
-            search_tz_m=(-0.005, 0.0, 0.005),
-        )
-        T_search, fine_info = local_hypothesis_search(
-            src_head_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_init=T_coarse,
-            wrist_depth_m=after_depth_m, wrist_rgb=after_rgb,
-            wrist_intr=after_intr, T_wrist_to_base=T_after_cam_to_frame,
-            cfg=fine_cfg,
-        )
-        debug["fine_score"] = fine_info.get("score", -1e9)
-        debug["fine_ms"] = int((time.perf_counter() - t1) * 1000)
-    else:
-        T_search, info = local_hypothesis_search(
-            src_head_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_init=T_init,
-            wrist_depth_m=after_depth_m, wrist_rgb=after_rgb,
-            wrist_intr=after_intr, T_wrist_to_base=T_after_cam_to_frame,
-            cfg=cfg,
-        )
-        debug["search_score"] = info.get("score", -1e9)
-        debug["search_ms"] = int((time.perf_counter() - t0) * 1000)
-
-    t_icp = time.perf_counter()
-    try:
-        T_gicp, gicp_res = refine_with_gicp(src_pcd, tgt_pcd, T_search, cfg)
-        debug["gicp_fitness"] = float(gicp_res.fitness)
-        debug["gicp_inlier_rmse"] = float(gicp_res.inlier_rmse)
-    except Exception as e:
-        debug["gicp_error"] = str(e)
-        T_gicp = T_search
-        debug["gicp_fitness"] = 0.0
-        debug["gicp_inlier_rmse"] = 1.0
-    debug["gicp_ms"] = int((time.perf_counter() - t_icp) * 1000)
-
-    T_final = T_gicp
-    if cfg.use_colored_icp:
-        t_c = time.perf_counter()
-        try:
-            T_col, col_res = refine_with_colored_icp(src_pcd, tgt_pcd, T_gicp, cfg)
-            T_final = T_col
-            debug["colored_icp_fitness"] = float(col_res.fitness)
-            debug["colored_icp_inlier_rmse"] = float(col_res.inlier_rmse)
-        except Exception as e:
-            debug["colored_icp_error"] = str(e).split("\n")[0]
-            debug["colored_icp_fitness"] = debug["gicp_fitness"]
-            debug["colored_icp_inlier_rmse"] = debug["gicp_inlier_rmse"]
-        debug["colored_icp_ms"] = int((time.perf_counter() - t_c) * 1000)
-
-    debug["total_reg_ms"] = int((time.perf_counter() - t0) * 1000)
-    return T_final, debug
-
-
-# ============================================================================
-# Quality assessment
-# ============================================================================
-
-def assess_quality(gicp_fitness: float, gicp_rmse: float) -> Dict[str, Any]:
-    quality, reasons = "good", []
-    if gicp_fitness < 0.3:
-        quality = "poor"
-        reasons.append(f"low fitness ({gicp_fitness:.3f})")
-    elif gicp_fitness < 0.5:
-        quality = "fair"
-        reasons.append(f"moderate fitness ({gicp_fitness:.3f})")
-    if gicp_rmse > 0.01:
-        quality = "poor"
-        reasons.append(f"high RMSE ({gicp_rmse:.4f}m)")
-    elif gicp_rmse > 0.005:
-        if quality != "poor":
-            quality = "fair"
-        reasons.append(f"moderate RMSE ({gicp_rmse:.4f}m)")
-    return {"quality": quality, "reasons": reasons}
-
-
-# ============================================================================
-# Main pipeline
-# ============================================================================
-
-def run_reestimation(
-    before_rgb: np.ndarray,
-    before_depth: np.ndarray,
-    before_mask: np.ndarray,
-    after_rgb: np.ndarray,
-    after_depth: np.ndarray,
-    after_mask: np.ndarray,
-    K_wrist: CameraIntrinsics,
-    T_cam_to_base_before: np.ndarray | None = None,
-    T_cam_to_base_after: np.ndarray | None = None,
-    T_wrist_to_ee: np.ndarray | None = None,
-    old_obb: OBBState | None = None,
-    use_coarse_fine: bool = True,
-    enable_pcd_fit: bool = True,
-    enable_lightglue_init: bool = True,
-    enable_tapir_init: bool = True,
-    init_candidate_mode: str = "auto",
-    lightglue_cfg: LightGlueMatchConfig | None = None,
-    tapir_cfg: TapirMatchConfig | None = None,
-    cfg: RegistrationConfig | None = None,
-) -> ReEstimationResult:
-    """
-    Main re-estimation entry point.
-
-    Mode 1 (world): both T_cam_to_base provided
-        → point clouds transformed to base frame → registration in base frame
-        → output: T_reg (base frame), T_slip, updated OBB (if old_obb given)
-
-    Mode 2 (camera): cam_to_base not provided
-        → registration in camera frame
-        → output: T_reg (camera frame) = T_slip (if T_wrist_to_ee ≈ I)
-    """
-    if o3d is None:
-        raise RuntimeError("open3d is required")
-    if cfg is None:
-        cfg = RegistrationConfig()
-
-    t_total = time.perf_counter()
-    debug: Dict[str, Any] = {}
-    stage_timings: Dict[str, float] = {}
-
-    has_extrinsics = (T_cam_to_base_before is not None and T_cam_to_base_after is not None)
-    mode = "world" if has_extrinsics else "camera"
-    debug["mode"] = mode
-    init_candidate_mode = _normalize_init_candidate_mode(init_candidate_mode)
-    single_method_mode = init_candidate_mode != "auto"
-    lightglue_only = init_candidate_mode == "lightglue"
-    tapir_only = init_candidate_mode == "tapir"
-    if lightglue_only:
-        enable_lightglue_init = True
-    if tapir_only:
-        enable_tapir_init = True
-    debug["init_candidate_mode"] = init_candidate_mode
-    debug["single_init_method_mode"] = bool(single_method_mode)
-    debug["pcd_fit_enabled"] = bool(enable_pcd_fit)
-    debug["lightglue_init_enabled"] = bool(enable_lightglue_init)
-    debug["tapir_init_enabled"] = bool(enable_tapir_init)
-
-    # --- Build point clouds in camera frame ---
-    t_pcd = time.perf_counter()
-    t_stage = time.perf_counter()
-    before_pcd_cam = rgbd_to_pointcloud(before_rgb, before_depth, before_mask, K_wrist, cfg)
-    stage_timings["pointcloud / build before"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    after_pcd_cam = rgbd_to_pointcloud(after_rgb, after_depth, after_mask, K_wrist, cfg)
-    stage_timings["pointcloud / build after"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    before_pcd_cam = preprocess_pcd(before_pcd_cam, cfg)
-    stage_timings["pointcloud / preprocess before"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    after_pcd_cam = preprocess_pcd(after_pcd_cam, cfg)
-    stage_timings["pointcloud / preprocess after"] = time.perf_counter() - t_stage
-
-    debug["before_points"] = len(before_pcd_cam.points)
-    debug["after_points"] = len(after_pcd_cam.points)
-    debug["pcd_ms"] = int((time.perf_counter() - t_pcd) * 1000)
-    stage_timings["pointcloud / total"] = time.perf_counter() - t_pcd
-
-    # --- Optional primitive fitting in camera frame ---
-    shape_before_fit: Dict[str, Any] | None = None
-    shape_after_fit: Dict[str, Any] | None = None
-    K_mat = np.array([
-        [K_wrist.fx, 0.0, K_wrist.cx],
-        [0.0, K_wrist.fy, K_wrist.cy],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
-    before_pts_cam = np.asarray(before_pcd_cam.points, dtype=np.float64)
-    after_pts_cam = np.asarray(after_pcd_cam.points, dtype=np.float64)
-    if enable_pcd_fit:
-        t_shape_total = time.perf_counter()
-        if len(before_pts_cam) >= 40:
-            t_stage = time.perf_counter()
-            try:
-                shape_before_fit = fit_camera_primitive_from_points(
-                    before_pts_cam,
-                    image_mask=before_mask,
-                    camera_intrinsics=K_mat,
-                )
-                debug["shape_before_fit"] = serialize_fit_result(shape_before_fit)
-                debug["shape_before_confidence"] = _shape_fit_confidence(shape_before_fit)
-                debug["_shape_before_fit_raw"] = shape_before_fit
-            except Exception as exc:
-                debug["shape_before_fit_error"] = str(exc)
-            finally:
-                stage_timings["pcd fit / before"] = time.perf_counter() - t_stage
-        if len(after_pts_cam) >= 40:
-            t_stage = time.perf_counter()
-            try:
-                shape_after_fit = fit_camera_primitive_from_points(
-                    after_pts_cam,
-                    image_mask=after_mask,
-                    camera_intrinsics=K_mat,
-                )
-                debug["shape_after_fit"] = serialize_fit_result(shape_after_fit)
-                debug["shape_after_confidence"] = _shape_fit_confidence(shape_after_fit)
-                debug["_shape_after_fit_raw"] = shape_after_fit
-            except Exception as exc:
-                debug["shape_after_fit_error"] = str(exc)
-            finally:
-                stage_timings["pcd fit / after"] = time.perf_counter() - t_stage
-        stage_timings["pcd fit / total"] = time.perf_counter() - t_shape_total
-    else:
-        debug["shape_fit_skipped_reason"] = "pcd-fit disabled by user"
-
-    # --- Transform to working frame ---
-    t_stage = time.perf_counter()
-    if has_extrinsics:
-        T_before = np.asarray(T_cam_to_base_before, dtype=np.float64).reshape(4, 4)
-        T_after = np.asarray(T_cam_to_base_after, dtype=np.float64).reshape(4, 4)
-        src_pcd = copy_pcd(before_pcd_cam)
-        src_pcd.transform(T_before)
-        tgt_pcd = copy_pcd(after_pcd_cam)
-        tgt_pcd.transform(T_after)
-        # For visibility scoring, need to project back to after-camera frame
-        T_scoring_cam = T_after
-        T_before_shape_frame = T_before
-        T_after_shape_frame = T_after
-    else:
-        # Stay in camera frame
-        src_pcd = copy_pcd(before_pcd_cam)
-        tgt_pcd = copy_pcd(after_pcd_cam)
-        T_scoring_cam = np.eye(4, dtype=np.float64)
-        T_before_shape_frame = np.eye(4, dtype=np.float64)
-        T_after_shape_frame = np.eye(4, dtype=np.float64)
-    stage_timings["frame transform / working frame"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    (
-        shape_before_active_fit,
-        shape_after_active_fit,
-        shape_before_desc,
-        shape_after_desc,
-        shape_prior_pair,
-    ) = _select_effective_shape_pair(
-        shape_before_fit, shape_after_fit,
-        T_before_shape_frame, T_after_shape_frame,
-    )
-    debug["shape_prior_pair"] = shape_prior_pair
-    shape_init_candidates = _build_shape_init_candidates(shape_before_desc, shape_after_desc)
-    debug["shape_init_candidates"] = [name for name, _ in shape_init_candidates]
-    stage_timings["shape prior / prepare"] = time.perf_counter() - t_stage
-
-    shape_relation_info: Dict[str, Any] | None = None
-    t_stage = time.perf_counter()
-    if (
-        shape_prior_pair.get("selected")
-        and
-        shape_before_active_fit is not None and shape_after_active_fit is not None
-        and _shape_type_family(shape_before_active_fit.get("best_type")) == "elongated_solid"
-        and _shape_type_family(shape_after_active_fit.get("best_type")) == "elongated_solid"
-    ):
-        before_profile = _axis_profile_signature(
-            before_rgb, before_mask, before_depth, K_wrist,
-            _camera_fit_endpoints(shape_before_active_fit),
-        )
-        after_profile = _axis_profile_signature(
-            after_rgb, after_mask, after_depth, K_wrist,
-            _camera_fit_endpoints(shape_after_active_fit),
-        )
-        shape_relation_info = _compare_axis_profile_signatures(before_profile, after_profile)
-        if shape_relation_info.get("available"):
-            debug["shape_relation_info"] = {
-                k: v for k, v in shape_relation_info.items()
-                if k in {"available", "preferred_relation", "same_score", "reversed_score", "confidence", "coverage"}
-            }
-    stage_timings["shape prior / relation cue"] = time.perf_counter() - t_stage
-    stage_timings["shape prior / total"] = (
-        stage_timings.get("shape prior / prepare", 0.0)
-        + stage_timings.get("shape prior / relation cue", 0.0)
-    )
-
-    # --- Initialization candidates ---
-    registration_total_start = time.perf_counter()
-    t_stage = time.perf_counter()
-    src_pts = np.asarray(src_pcd.points)
-    tgt_pts = np.asarray(tgt_pcd.points)
-
-    # --- After-image depth in meters for projection scoring ---
-    if after_depth.dtype.kind in {"u", "i"}:
-        after_depth_m = after_depth.astype(np.float32) / float(cfg.depth_scale)
-    else:
-        after_depth_m = after_depth.astype(np.float32)
-
-    init_buckets: dict[str, list[tuple[str, np.ndarray]]] = {
-        "pca": [],
-        "centroid": [],
-        "shape": [],
-        "silhouette": [],
-        "fpfh": [],
-        "lightglue": [],
-        "tapir": [],
-    }
-    try:
-        pca_candidates, pca_frame_rows = _build_frame_pca_init_candidates(src_pts, tgt_pts)
-        for name, T_pca in pca_candidates:
-            _append_unique_init(init_buckets["pca"], name, T_pca)
-        debug["pca_frame_init"] = {
-            "enabled": True,
-            "version": "robust_frame_axis_permutation",
-            "num_candidates_added": int(len(init_buckets["pca"])),
-            "candidate_names": [name for name, _ in init_buckets["pca"]],
-            "diagnostics": pca_frame_rows,
-        }
-    except Exception as exc:
-        pca_candidates = pca_initial_transform_candidates(src_pts, tgt_pts)
-        for idx, (T_pca, _) in enumerate(pca_candidates[:2]):
-            _append_unique_init(init_buckets["pca"], f"pca_{idx}", T_pca)
-            if idx == 0:
-                _append_unique_init(
-                    init_buckets["pca"],
-                    f"pca_{idx}_rz180",
-                    _rotate_transform_about_src_centroid(T_pca, src_pts, axis="z", angle_deg=180.0),
-                )
-        debug["pca_frame_init"] = {
-            "enabled": True,
-            "version": "legacy_fallback",
-            "error": str(exc),
-            "num_candidates_added": int(len(init_buckets["pca"])),
-            "candidate_names": [name for name, _ in init_buckets["pca"]],
-        }
-
-    centroid_T = make_transform(np.eye(3), tgt_pts.mean(axis=0) - src_pts.mean(axis=0))
-    _append_unique_init(init_buckets["centroid"], "centroid", centroid_T)
-    _append_unique_init(
-        init_buckets["centroid"],
-        "centroid_rz180",
-        _rotate_transform_about_src_centroid(centroid_T, src_pts, axis="z", angle_deg=180.0),
-    )
-    for name, T_shape in shape_init_candidates:
-        _append_unique_init(init_buckets["shape"], name, T_shape)
-
-    base_inits_for_silhouette: list[tuple[str, np.ndarray]] = []
-    for method in ("pca", "centroid", "shape"):
-        for name, T in init_buckets[method]:
-            _append_unique_init(base_inits_for_silhouette, name, T)
-
-    if init_candidate_mode not in {"auto", "silhouette"}:
-        debug["silhouette_init"] = {"enabled": False, "skipped_reason": f"{init_candidate_mode} method"}
-        stage_timings["silhouette init / projection search"] = 0.0
-    else:
-        t_silhouette = time.perf_counter()
-        try:
-            silhouette_candidates, silhouette_rows = _build_silhouette_search_candidates(
-                src_pcd=src_pcd,
-                base_inits=list(base_inits_for_silhouette),
-                target_mask=after_mask,
-                intr=K_wrist,
-                T_after_cam_to_frame=T_scoring_cam,
-                depth_ref=after_depth_m,
-                shape_after_desc=shape_after_desc,
-            )
-            silhouette_added_names: list[str] = []
-            for name, T_silhouette in silhouette_candidates:
-                before_count = len(init_buckets["silhouette"])
-                _append_unique_init(init_buckets["silhouette"], name, T_silhouette)
-                if len(init_buckets["silhouette"]) > before_count:
-                    silhouette_added_names.append(name)
-            debug["silhouette_init"] = {
-                "enabled": True,
-                "num_candidates_added": int(len(silhouette_added_names)),
-                "candidate_names": silhouette_added_names,
-                "subclasses": {
-                    "coarse": [name for name in silhouette_added_names if not name.startswith("silhouette_sweep_")],
-                    "sweep": [name for name in silhouette_added_names if name.startswith("silhouette_sweep_")],
-                },
-                "diagnostics": silhouette_rows,
-            }
-        except Exception as exc:
-            debug["silhouette_init"] = {
-                "enabled": True,
-                "success": False,
-                "error": str(exc),
-            }
-        finally:
-            stage_timings["silhouette init / projection search"] = time.perf_counter() - t_silhouette
-
-    if init_candidate_mode not in {"auto", "fpfh"}:
-        debug["pcd_fpfh_ransac"] = {"enabled": False, "skipped_reason": f"{init_candidate_mode} method"}
-        stage_timings["pcd ransac / fpfh"] = 0.0
-    else:
-        t_pcd_ransac = time.perf_counter()
-        try:
-            T_ransac, ransac_info = fpfh_ransac_initial_transform(src_pcd, tgt_pcd, cfg)
-            _append_unique_init(init_buckets["fpfh"], "pcd_fpfh_ransac", T_ransac)
-            debug["pcd_fpfh_ransac"] = {
-                "enabled": True,
-                "success": True,
-                **ransac_info,
-            }
-        except Exception as exc:
-            debug["pcd_fpfh_ransac"] = {
-                "enabled": bool(getattr(cfg, "use_fpfh_ransac_init", True)),
-                "success": False,
-                "error": str(exc),
-            }
-        finally:
-            stage_timings["pcd ransac / fpfh"] = time.perf_counter() - t_pcd_ransac
-
-    lightglue_candidate: tuple[str, np.ndarray] | None = None
-    run_lightglue_init = bool(enable_lightglue_init) and init_candidate_mode in {"auto", "lightglue"}
-    if run_lightglue_init:
-        t_lightglue = time.perf_counter()
-        try:
-            lightglue_res = estimate_lightglue_init_transform(
-                before_rgb=before_rgb,
-                before_depth_m=before_depth,
-                before_mask=before_mask,
-                after_rgb=after_rgb,
-                after_depth_m=after_depth,
-                after_mask=after_mask,
-                intr=K_wrist,
-                cfg=lightglue_cfg or LightGlueMatchConfig(),
-            )
-            debug["lightglue_init"] = lightglue_res.debug
-            debug["_lightglue_init_raw"] = lightglue_res
-            if lightglue_res.success and lightglue_res.T_before_cam_to_after_cam is not None:
-                T_feat_cam = np.asarray(lightglue_res.T_before_cam_to_after_cam, dtype=np.float64).reshape(4, 4)
-                if has_extrinsics:
-                    T_feat_work = T_after @ T_feat_cam @ np.linalg.inv(T_before)
-                else:
-                    T_feat_work = T_feat_cam
-                lightglue_candidate = ("lightglue", T_feat_work)
-                _append_unique_init(init_buckets["lightglue"], "lightglue", T_feat_work)
-                debug["lightglue_init"]["hybrid_candidates"] = []
-                debug["lightglue_init"]["candidate_added"] = True
-            else:
-                debug["lightglue_init"]["hybrid_candidates"] = []
-                debug["lightglue_init"]["candidate_added"] = False
-        except Exception as exc:
-            debug["lightglue_init"] = {
-                "enabled": True,
-                "success": False,
-                "error": str(exc),
-                "stage": "estimate_lightglue_init_transform",
-            }
-        finally:
-            stage_timings["lightglue init / superpoint-lightglue"] = time.perf_counter() - t_lightglue
-    else:
-        reason = "disabled by user" if not enable_lightglue_init else f"{init_candidate_mode} method"
-        debug["lightglue_init"] = {"enabled": False, "skipped_reason": reason}
-        stage_timings["lightglue init / superpoint-lightglue"] = 0.0
-
-    tapir_candidate: tuple[str, np.ndarray] | None = None
-    run_tapir_init = bool(enable_tapir_init) and init_candidate_mode in {"auto", "tapir"}
-    if run_tapir_init:
-        t_tapir = time.perf_counter()
-        try:
-            tapir_res = estimate_tapir_init_transform(
-                before_rgb=before_rgb,
-                before_depth_m=before_depth,
-                before_mask=before_mask,
-                after_rgb=after_rgb,
-                after_depth_m=after_depth,
-                after_mask=after_mask,
-                intr=K_wrist,
-                cfg=tapir_cfg or TapirMatchConfig(),
-            )
-            debug["tapir_init"] = tapir_res.debug
-            debug["_tapir_init_raw"] = tapir_res
-            if tapir_res.success and tapir_res.T_before_cam_to_after_cam is not None:
-                T_tapir_cam = np.asarray(tapir_res.T_before_cam_to_after_cam, dtype=np.float64).reshape(4, 4)
-                if has_extrinsics:
-                    T_tapir_work = T_after @ T_tapir_cam @ np.linalg.inv(T_before)
-                else:
-                    T_tapir_work = T_tapir_cam
-                tapir_candidate = ("tapir", T_tapir_work)
-                _append_unique_init(init_buckets["tapir"], "tapir", T_tapir_work)
-                debug["tapir_init"]["candidate_added"] = True
-            else:
-                debug["tapir_init"]["candidate_added"] = False
-        except Exception as exc:
-            debug["tapir_init"] = {
-                "enabled": True,
-                "success": False,
-                "error": str(exc),
-                "stage": "estimate_tapir_init_transform",
-            }
-        finally:
-            stage_timings["tapir init / tapir"] = time.perf_counter() - t_tapir
-    else:
-        reason = "disabled by user" if not enable_tapir_init else f"{init_candidate_mode} method"
-        debug["tapir_init"] = {"enabled": False, "skipped_reason": reason}
-        stage_timings["tapir init / tapir"] = 0.0
-
-    T_inits: list[tuple[str, np.ndarray]] = []
-    if init_candidate_mode == "auto":
-        for method in ("pca", "centroid", "shape", "silhouette", "fpfh", "lightglue", "tapir"):
-            for name, T in init_buckets[method]:
-                _append_unique_init(T_inits, name, T)
-    else:
-        for name, T in init_buckets[init_candidate_mode]:
-            _append_unique_init(T_inits, name, T)
-
-    debug["init_method_buckets"] = {method: [name for name, _ in items] for method, items in init_buckets.items()}
-    if lightglue_only:
-        if lightglue_candidate is not None:
-            debug["lightglue_init"]["candidate_added"] = True
-        else:
-            debug["lightglue_init"]["candidate_added"] = False
-            # When lightglue fails, add a marked pca as fallback with special name
-            T_pca_fallback = pca_initial_transform(src_pts, tgt_pts)
-            T_inits.append(("__lightglue_fallback_pca__", T_pca_fallback))
-        debug["lightglue_only_forced"] = True
-    if tapir_only:
-        if tapir_candidate is not None:
-            debug["tapir_init"]["candidate_added"] = True
-        else:
-            debug["tapir_init"]["candidate_added"] = False
-            # Match lightglue-only behavior: keep the single-method run alive,
-            # but make the fallback source explicit in metrics and output names.
-            T_pca_fallback = pca_initial_transform(src_pts, tgt_pts)
-            T_inits.append(("__tapir_fallback_pca__", T_pca_fallback))
-        debug["tapir_only_forced"] = True
-
-    if not T_inits:
-        if single_method_mode and init_candidate_mode not in {"lightglue", "tapir"}:
-            raise RuntimeError(f"Init method '{init_candidate_mode}' did not produce any candidates.")
-        T_inits.append(("pca", pca_initial_transform(src_pts, tgt_pts)))
-    stage_timings["registration / init candidates"] = time.perf_counter() - t_stage
-
-    # --- Run registration with each init, pick best ---
-    best_T = np.eye(4, dtype=np.float64)
-    best_score = -1e9
-    best_init = "none"
-    best_reg_debug: Dict[str, Any] = {}
-    init_diagnostics: list[Dict[str, Any]] = []
-
-    t_stage = time.perf_counter()
-    for name, T_init in T_inits:
-        try:
-            T_reg, reg_dbg = coarse_fine_registration(
-                src_pcd=src_pcd, tgt_pcd=tgt_pcd, T_init=T_init,
-                after_depth_m=after_depth_m, after_rgb=after_rgb,
-                after_intr=K_wrist, T_after_cam_to_frame=T_scoring_cam,
-                cfg=cfg, use_coarse_fine=use_coarse_fine,
-            )
-            vis_info = visibility_aware_score(
-                src_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_srcbase_to_tgtbase=T_reg,
-                wrist_depth=after_depth_m, wrist_rgb=after_rgb,
-                wrist_intr=K_wrist, T_wrist_to_base=T_scoring_cam, cfg=cfg,
-            )
-            sil_info = _projected_mask_alignment_metrics(
-                src_pcd=src_pcd,
-                T_src_to_tgt=T_reg,
-                target_mask=after_mask,
-                intr=K_wrist,
-                T_after_cam_to_frame=T_scoring_cam,
-                depth_ref=after_depth_m,
-                depth_tol_m=max(cfg.depth_consistency_thresh_m * 4.0, 0.03),
-            )
-            cloud_info = _pointcloud_overlap_metrics(
-                src_pcd=src_pcd,
-                tgt_pcd=tgt_pcd,
-                T_src_to_tgt=T_reg,
-                cfg=cfg,
-            )
-            shape_info = _shape_similarity_score(
-                shape_before_desc, shape_after_desc, T_reg,
-                relation_info=shape_relation_info,
-            )
-            combined_score = _combine_registration_scores(
-                vis_info.get("score", -1e9),
-                sil_info,
-                shape_metrics=shape_info,
-                cloud_metrics=cloud_info,
-            )
-            score_info = {
-                **vis_info,
-                "silhouette_precision": sil_info["precision"],
-                "silhouette_recall": sil_info["recall"],
-                "silhouette_iou": sil_info["iou"],
-                "silhouette_f1": sil_info["f1"],
-                "cloud_overlap_enabled": cloud_info.get("enabled", False),
-                "cloud_overlap_weight": cloud_info.get("weight", 0.0),
-                "cloud_overlap_score": cloud_info.get("score", 0.0),
-                "cloud_overlap_precision": cloud_info.get("precision", 0.0),
-                "cloud_overlap_recall": cloud_info.get("recall", 0.0),
-                "cloud_overlap_f1": cloud_info.get("f1", 0.0),
-                "cloud_overlap_chamfer_m": cloud_info.get("chamfer_m", 0.0),
-                "cloud_overlap_robust_m": cloud_info.get("robust_m", 0.0),
-                "shape_enabled": shape_info.get("enabled", False),
-                "shape_weight": shape_info.get("weight", 0.0),
-                "shape_score": shape_info.get("score", 0.0),
-                "shape_confidence": shape_info.get("confidence", 0.0),
-                "shape_compatibility": shape_info.get("compatibility", 0.0),
-                "shape_center_score": shape_info.get("center_score", 0.0),
-                "shape_axis_score": shape_info.get("axis_score", 0.0),
-                "shape_size_score": shape_info.get("size_score", 0.0),
-                "shape_endpoint_score": shape_info.get("endpoint_score", 0.0),
-                "shape_rotation_score": shape_info.get("rotation_score", 0.0),
-                "shape_relation_score": shape_info.get("relation_score", 0.0),
-                "combined_score": combined_score,
-            }
-            init_diagnostics.append(_registration_score_entry(
-                name,
-                combined_score,
-                vis_info,
-                sil_info,
-                shape_info,
-                cloud_info,
-                reg_dbg=reg_dbg,
-                extra={"stage": "init"},
-            ))
-            if combined_score > best_score:
-                best_score = combined_score
-                best_T = T_reg
-                best_init = name
-                best_reg_debug = {**reg_dbg, **score_info}
-        except Exception as e:
-            debug[f"init_{name}_error"] = str(e)
-    stage_timings["registration / all init candidates"] = time.perf_counter() - t_stage
-
-    debug["candidate_inits"] = [_display_init_name(name) for name, _ in T_inits]
-    debug["init_diagnostics"] = _sanitize_init_names_for_output(
-        sorted(init_diagnostics, key=lambda row: row["combined_score"], reverse=True)
-    )
-    debug["initial_best_init"] = _display_init_name(best_init)
-    debug["initial_best_score"] = best_score
-    best_init = _display_init_name(best_init)
-    
-    # Extract core init method for artifact naming (strip micro-refine suffixes)
-    core_init_method = best_init.split("+")[0] if best_init else "aligned"
-    
-    debug["best_init"] = best_init
-    debug["best_score"] = best_score
-    debug["_core_init_for_artifacts"] = core_init_method
-    debug.update({f"reg_{k}": v for k, v in best_reg_debug.items()})
-
-    # --- M3 endpoint-direction flip resolution for elongated objects ---
-    t_stage = time.perf_counter()
-    if (
-        shape_relation_info
-        and shape_relation_info.get("available")
-        and shape_relation_info.get("confidence", 0.0) >= 0.12
-        and shape_before_desc is not None
-        and shape_after_desc is not None
-        and shape_before_desc.get("axis") is not None
-        and shape_after_desc.get("axis") is not None
-    ):
-        src_axis_t = _safe_normalize(best_T[:3, :3] @ np.asarray(shape_before_desc["axis"], dtype=np.float64))
-        tgt_axis = _safe_normalize(np.asarray(shape_after_desc["axis"], dtype=np.float64))
-        axis_dot = float(np.clip(np.dot(src_axis_t, tgt_axis), -1.0, 1.0))
-        pref = shape_relation_info.get("preferred_relation", "same")
-        relation_conflict = (
-            (pref == "reversed" and axis_dot > 0.35) or
-            (pref == "same" and axis_dot < -0.35)
-        )
-        if relation_conflict:
-            pivot = (
-                best_T[:3, :3] @ np.asarray(shape_before_desc["origin"], dtype=np.float64)
-                + best_T[:3, 3]
-            )
-            camera_forward = _safe_normalize(T_scoring_cam[:3, :3] @ np.array([0.0, 0.0, 1.0], dtype=np.float64))
-            flip_axis = _safe_normalize(np.cross(src_axis_t, camera_forward))
-            if np.linalg.norm(flip_axis) < 1e-6:
-                flip_axis = _orthogonal_unit(src_axis_t)
-            T_flip = _rotate_transform_about_world_pivot(best_T, pivot, flip_axis, angle_deg=180.0)
-            try:
-                flip_vis = visibility_aware_score(
-                    src_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_srcbase_to_tgtbase=T_flip,
-                    wrist_depth=after_depth_m, wrist_rgb=after_rgb,
-                    wrist_intr=K_wrist, T_wrist_to_base=T_scoring_cam, cfg=cfg,
-                )
-                flip_sil = _projected_mask_alignment_metrics(
-                    src_pcd=src_pcd,
-                    T_src_to_tgt=T_flip,
-                    target_mask=after_mask,
-                    intr=K_wrist,
-                    T_after_cam_to_frame=T_scoring_cam,
-                    depth_ref=after_depth_m,
-                    depth_tol_m=max(cfg.depth_consistency_thresh_m * 4.0, 0.03),
-                )
-                flip_cloud = _pointcloud_overlap_metrics(
-                    src_pcd=src_pcd,
-                    tgt_pcd=tgt_pcd,
-                    T_src_to_tgt=T_flip,
-                    cfg=cfg,
-                )
-                flip_shape = _shape_similarity_score(
-                    shape_before_desc, shape_after_desc, T_flip,
-                    relation_info=shape_relation_info,
-                )
-                flip_score = _combine_registration_scores(
-                    flip_vis.get("score", -1e9), flip_sil, shape_metrics=flip_shape, cloud_metrics=flip_cloud,
-                )
-                debug["m3_flip_candidate_score"] = flip_score
-                debug["m3_flip_axis_dot_before"] = axis_dot
-                debug["m3_flip_relation_preference"] = pref
-                if flip_score > best_score + 0.015 and flip_shape.get("relation_score", 0.0) >= best_reg_debug.get("shape_relation_score", 0.0):
-                    best_T = T_flip
-                    best_score = flip_score
-                    best_init = f"{best_init}+m3_flip"
-                    best_reg_debug = {
-                        **best_reg_debug,
-                        "shape_enabled": flip_shape.get("enabled", False),
-                        "shape_weight": flip_shape.get("weight", 0.0),
-                        "shape_score": flip_shape.get("score", 0.0),
-                        "shape_confidence": flip_shape.get("confidence", 0.0),
-                        "shape_compatibility": flip_shape.get("compatibility", 0.0),
-                        "shape_center_score": flip_shape.get("center_score", 0.0),
-                        "shape_axis_score": flip_shape.get("axis_score", 0.0),
-                        "shape_size_score": flip_shape.get("size_score", 0.0),
-                        "shape_endpoint_score": flip_shape.get("endpoint_score", 0.0),
-                        "shape_rotation_score": flip_shape.get("rotation_score", 0.0),
-                        "shape_relation_score": flip_shape.get("relation_score", 0.0),
-                        "silhouette_precision": flip_sil["precision"],
-                        "silhouette_recall": flip_sil["recall"],
-                        "silhouette_iou": flip_sil["iou"],
-                        "silhouette_f1": flip_sil["f1"],
-                        "cloud_overlap_enabled": flip_cloud.get("enabled", False),
-                        "cloud_overlap_weight": flip_cloud.get("weight", 0.0),
-                        "cloud_overlap_score": flip_cloud.get("score", 0.0),
-                        "cloud_overlap_precision": flip_cloud.get("precision", 0.0),
-                        "cloud_overlap_recall": flip_cloud.get("recall", 0.0),
-                        "cloud_overlap_f1": flip_cloud.get("f1", 0.0),
-                        "cloud_overlap_chamfer_m": flip_cloud.get("chamfer_m", 0.0),
-                        "cloud_overlap_robust_m": flip_cloud.get("robust_m", 0.0),
-                        "combined_score": flip_score,
-                        "m3_flip_applied": True,
-                    }
-            except Exception as exc:
-                debug["m3_flip_error"] = str(exc)
-    stage_timings["registration / m3 flip"] = time.perf_counter() - t_stage
-
-    # --- Shape-center snap refinement for near-miss alignments ---
-    t_stage = time.perf_counter()
-    if (
-        shape_prior_pair.get("selected")
-        and shape_before_desc is not None
-        and shape_after_desc is not None
-        and shape_before_desc.get("origin") is not None
-        and shape_after_desc.get("origin") is not None
-        and best_reg_debug.get("shape_center_score", 0.0) < 0.72
-    ):
-        shape_snap_diagnostics: list[Dict[str, Any]] = []
-        try:
-            src_origin = np.asarray(shape_before_desc["origin"], dtype=np.float64)
-            tgt_origin = np.asarray(shape_after_desc["origin"], dtype=np.float64)
-            src_origin_t = best_T[:3, :3] @ src_origin + best_T[:3, 3]
-            center_delta = tgt_origin - src_origin_t
-            snap_candidates: list[tuple[str, np.ndarray]] = []
-
-            def _append_snap(name: str, delta_vec: np.ndarray) -> None:
-                delta_vec = np.asarray(delta_vec, dtype=np.float64).reshape(3)
-                if not np.all(np.isfinite(delta_vec)):
-                    return
-                if float(np.linalg.norm(delta_vec)) < 1e-5:
-                    return
-                T_cand = best_T.copy()
-                T_cand[:3, 3] += delta_vec
-                snap_candidates.append((name, T_cand))
-
-            _append_snap("shape_snap_half", 0.5 * center_delta)
-            _append_snap("shape_snap_full", center_delta)
-            if shape_after_desc.get("axis") is not None:
-                axis_tgt = _safe_normalize(np.asarray(shape_after_desc["axis"], dtype=np.float64))
-                delta_axis = float(np.dot(center_delta, axis_tgt)) * axis_tgt
-                delta_perp = center_delta - delta_axis
-                _append_snap("shape_snap_perp", delta_perp)
-                _append_snap("shape_snap_axis_half", 0.5 * delta_axis)
-
-            best_snap: tuple[str, np.ndarray, Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float], float] | None = None
-            for snap_name, T_snap in snap_candidates:
-                snap_vis = visibility_aware_score(
-                    src_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_srcbase_to_tgtbase=T_snap,
-                    wrist_depth=after_depth_m, wrist_rgb=after_rgb,
-                    wrist_intr=K_wrist, T_wrist_to_base=T_scoring_cam, cfg=cfg,
-                )
-                snap_sil = _projected_mask_alignment_metrics(
-                    src_pcd=src_pcd,
-                    T_src_to_tgt=T_snap,
-                    target_mask=after_mask,
-                    intr=K_wrist,
-                    T_after_cam_to_frame=T_scoring_cam,
-                    depth_ref=after_depth_m,
-                    depth_tol_m=max(cfg.depth_consistency_thresh_m * 4.0, 0.03),
-                )
-                snap_cloud = _pointcloud_overlap_metrics(
-                    src_pcd=src_pcd,
-                    tgt_pcd=tgt_pcd,
-                    T_src_to_tgt=T_snap,
-                    cfg=cfg,
-                )
-                snap_shape = _shape_similarity_score(
-                    shape_before_desc, shape_after_desc, T_snap,
-                    relation_info=shape_relation_info,
-                )
-                snap_score = _combine_registration_scores(
-                    snap_vis.get("score", -1e9), snap_sil, shape_metrics=snap_shape, cloud_metrics=snap_cloud,
-                )
-                shape_snap_diagnostics.append(_registration_score_entry(
-                    snap_name,
-                    snap_score,
-                    snap_vis,
-                    snap_sil,
-                    snap_shape,
-                    snap_cloud,
-                    extra={
-                        "stage": "shape_snap",
-                        "translation_delta_m": float(np.linalg.norm(T_snap[:3, 3] - best_T[:3, 3])),
-                    },
-                ))
-                if best_snap is None or snap_score > best_snap[-1]:
-                    best_snap = (snap_name, T_snap, snap_vis, snap_sil, snap_shape, snap_cloud, snap_score)
-
-            debug["shape_snap_diagnostics"] = sorted(
-                shape_snap_diagnostics,
-                key=lambda row: row["combined_score"],
-                reverse=True,
-            )
-            if best_snap is not None:
-                snap_name, T_snap, snap_vis, snap_sil, snap_shape, snap_cloud, snap_score = best_snap
-                debug["shape_snap_best_candidate"] = snap_name
-                debug["shape_snap_candidate_score"] = snap_score
-                debug["shape_snap_center_delta_m"] = float(np.linalg.norm(center_delta))
-                center_gain = float(snap_shape.get("center_score", 0.0) - best_reg_debug.get("shape_center_score", 0.0))
-                sil_gain = float(snap_sil.get("f1", 0.0) - best_reg_debug.get("silhouette_f1", 0.0))
-                snap_applied = False
-                if (
-                    snap_score > best_score + 0.006
-                    and center_gain > 0.08
-                    and sil_gain > -0.03
-                ):
-                    best_T = T_snap
-                    best_score = snap_score
-                    best_init = f"{best_init}+{snap_name}"
-                    best_reg_debug = {
-                        **best_reg_debug,
-                        "shape_enabled": snap_shape.get("enabled", False),
-                        "shape_weight": snap_shape.get("weight", 0.0),
-                        "shape_score": snap_shape.get("score", 0.0),
-                        "shape_confidence": snap_shape.get("confidence", 0.0),
-                        "shape_compatibility": snap_shape.get("compatibility", 0.0),
-                        "shape_center_score": snap_shape.get("center_score", 0.0),
-                        "shape_axis_score": snap_shape.get("axis_score", 0.0),
-                        "shape_size_score": snap_shape.get("size_score", 0.0),
-                        "shape_endpoint_score": snap_shape.get("endpoint_score", 0.0),
-                        "shape_rotation_score": snap_shape.get("rotation_score", 0.0),
-                        "shape_relation_score": snap_shape.get("relation_score", 0.0),
-                        "silhouette_precision": snap_sil["precision"],
-                        "silhouette_recall": snap_sil["recall"],
-                        "silhouette_iou": snap_sil["iou"],
-                        "silhouette_f1": snap_sil["f1"],
-                        "cloud_overlap_enabled": snap_cloud.get("enabled", False),
-                        "cloud_overlap_weight": snap_cloud.get("weight", 0.0),
-                        "cloud_overlap_score": snap_cloud.get("score", 0.0),
-                        "cloud_overlap_precision": snap_cloud.get("precision", 0.0),
-                        "cloud_overlap_recall": snap_cloud.get("recall", 0.0),
-                        "cloud_overlap_f1": snap_cloud.get("f1", 0.0),
-                        "cloud_overlap_chamfer_m": snap_cloud.get("chamfer_m", 0.0),
-                        "cloud_overlap_robust_m": snap_cloud.get("robust_m", 0.0),
-                        "combined_score": snap_score,
-                        "shape_snap_applied": snap_name,
-                    }
-                    snap_applied = True
-                for row in debug.get("shape_snap_diagnostics", []):
-                    row["is_best_shape_snap"] = bool(row["name"] == snap_name)
-                    row["applied"] = bool(snap_applied and row["name"] == snap_name)
-        except Exception as exc:
-            debug["shape_snap_error"] = str(exc)
-    stage_timings["registration / shape snap"] = time.perf_counter() - t_stage
-
-    # --- Final local metric refinement around the current best pose ---
-    shape_prior_selected = bool(shape_prior_pair.get("selected"))
-    current_sil_f1 = float(best_reg_debug.get("silhouette_f1", 0.0))
-    current_cloud_f1 = float(best_reg_debug.get("cloud_overlap_f1", 0.0))
-    current_shape_score = float(best_reg_debug.get("shape_score", 0.0))
-    strong_pose_seed = (
-        current_sil_f1 >= 0.45
-        or current_cloud_f1 >= 0.25
-        or (shape_prior_selected and current_shape_score >= 0.55)
-    )
-    need_micro_refine = strong_pose_seed and (
-        current_sil_f1 < 0.88
-        or (
-            best_reg_debug.get("cloud_overlap_enabled")
-            and current_cloud_f1 < 0.65
-        )
-        or (shape_prior_selected and current_shape_score < 0.88)
-    )
-    debug["micro_refine_gate"] = {
-        "shape_prior_selected": shape_prior_selected,
-        "current_silhouette_f1": current_sil_f1,
-        "current_cloud_overlap_f1": current_cloud_f1,
-        "current_shape_score": current_shape_score,
-        "strong_pose_seed": bool(strong_pose_seed),
-        "need_micro_refine": bool(need_micro_refine),
-    }
-    t_stage = time.perf_counter()
-    if need_micro_refine:
-        micro_round_diagnostics: list[Dict[str, Any]] = []
-        try:
-            if shape_after_desc is not None and shape_after_desc.get("axis") is not None:
-                axis_main = _safe_normalize(np.asarray(shape_after_desc["axis"], dtype=np.float64))
-                axis_perp0 = _orthogonal_unit(axis_main)
-                axis_perp1 = _safe_normalize(np.cross(axis_main, axis_perp0))
-                refine_axes = [
-                    ("axis", axis_main),
-                    ("perp0", axis_perp0),
-                    ("perp1", axis_perp1),
-                ]
-            else:
-                refine_axes = [
-                    ("x", np.array([1.0, 0.0, 0.0], dtype=np.float64)),
-                    ("y", np.array([0.0, 1.0, 0.0], dtype=np.float64)),
-                    ("z", np.array([0.0, 0.0, 1.0], dtype=np.float64)),
-                ]
-
-            refine_origin = None
-            if shape_after_desc is not None:
-                ref = shape_after_desc.get("family_origin", shape_after_desc.get("origin"))
-                if ref is not None:
-                    refine_origin = np.asarray(ref, dtype=np.float64)
-            if refine_origin is None:
-                refine_origin = np.asarray(tgt_pcd.points, dtype=np.float64).mean(axis=0)
-
-            trans_steps = (
-                max(cfg.voxel_size * 0.8, 0.0015),
-                max(cfg.voxel_size * 1.6, 0.0030),
-            )
-            rot_steps = (1.5, 3.0)
-            allow_micro_rotation = (
-                shape_prior_selected
-                or current_sil_f1 >= 0.78
-                or current_cloud_f1 >= 0.45
-            )
-            debug["micro_refine_gate"]["allow_micro_rotation"] = bool(allow_micro_rotation)
-            refine_T = best_T.copy()
-            refine_debug = dict(best_reg_debug)
-            refine_score = float(best_score)
-            refine_applied: list[str] = []
-
-            for round_idx in range(2):
-                best_round: tuple[str, np.ndarray, Dict[str, float], Dict[str, float], Dict[str, float], Dict[str, float], float] | None = None
-                for axis_name, axis_vec in refine_axes:
-                    axis_vec = _safe_normalize(np.asarray(axis_vec, dtype=np.float64))
-                    if np.linalg.norm(axis_vec) < 1e-8:
-                        continue
-                    for step in trans_steps:
-                        for sign, sign_name in ((-1.0, "minus"), (1.0, "plus")):
-                            T_cand = refine_T.copy()
-                            T_cand[:3, 3] += sign * step * axis_vec
-                            cand_vis = visibility_aware_score(
-                                src_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_srcbase_to_tgtbase=T_cand,
-                                wrist_depth=after_depth_m, wrist_rgb=after_rgb,
-                                wrist_intr=K_wrist, T_wrist_to_base=T_scoring_cam, cfg=cfg,
-                            )
-                            cand_sil = _projected_mask_alignment_metrics(
-                                src_pcd=src_pcd,
-                                T_src_to_tgt=T_cand,
-                                target_mask=after_mask,
-                                intr=K_wrist,
-                                T_after_cam_to_frame=T_scoring_cam,
-                                depth_ref=after_depth_m,
-                                depth_tol_m=max(cfg.depth_consistency_thresh_m * 4.0, 0.03),
-                            )
-                            cand_cloud = _pointcloud_overlap_metrics(
-                                src_pcd=src_pcd,
-                                tgt_pcd=tgt_pcd,
-                                T_src_to_tgt=T_cand,
-                                cfg=cfg,
-                            )
-                            cand_shape = _shape_similarity_score(
-                                shape_before_desc, shape_after_desc, T_cand,
-                                relation_info=shape_relation_info,
-                            )
-                            cand_score = _combine_registration_scores(
-                                cand_vis.get("score", -1e9),
-                                cand_sil,
-                                shape_metrics=cand_shape,
-                                cloud_metrics=cand_cloud,
-                            )
-                            candidate_name = f"micro_t_{axis_name}_{sign_name}_{step*1000.0:.1f}mm"
-                            if best_round is None or cand_score > best_round[-1]:
-                                best_round = (candidate_name, T_cand, cand_vis, cand_sil, cand_shape, cand_cloud, cand_score)
-                    if allow_micro_rotation:
-                        for angle in rot_steps:
-                            for sign, sign_name in ((-1.0, "minus"), (1.0, "plus")):
-                                T_cand = _rotate_transform_about_world_pivot(
-                                    refine_T, refine_origin, axis_vec, angle_deg=sign * angle,
-                                )
-                                cand_vis = visibility_aware_score(
-                                    src_pcd_base=src_pcd, tgt_pcd_base=tgt_pcd, T_srcbase_to_tgtbase=T_cand,
-                                    wrist_depth=after_depth_m, wrist_rgb=after_rgb,
-                                    wrist_intr=K_wrist, T_wrist_to_base=T_scoring_cam, cfg=cfg,
-                                )
-                                cand_sil = _projected_mask_alignment_metrics(
-                                    src_pcd=src_pcd,
-                                    T_src_to_tgt=T_cand,
-                                    target_mask=after_mask,
-                                    intr=K_wrist,
-                                    T_after_cam_to_frame=T_scoring_cam,
-                                    depth_ref=after_depth_m,
-                                    depth_tol_m=max(cfg.depth_consistency_thresh_m * 4.0, 0.03),
-                                )
-                                cand_cloud = _pointcloud_overlap_metrics(
-                                    src_pcd=src_pcd,
-                                    tgt_pcd=tgt_pcd,
-                                    T_src_to_tgt=T_cand,
-                                    cfg=cfg,
-                                )
-                                cand_shape = _shape_similarity_score(
-                                    shape_before_desc, shape_after_desc, T_cand,
-                                    relation_info=shape_relation_info,
-                                )
-                                cand_score = _combine_registration_scores(
-                                    cand_vis.get("score", -1e9),
-                                    cand_sil,
-                                    shape_metrics=cand_shape,
-                                    cloud_metrics=cand_cloud,
-                                )
-                                candidate_name = f"micro_r_{axis_name}_{sign_name}_{angle:.1f}deg"
-                                if best_round is None or cand_score > best_round[-1]:
-                                    best_round = (candidate_name, T_cand, cand_vis, cand_sil, cand_shape, cand_cloud, cand_score)
-
-                if best_round is None:
-                    break
-
-                cand_name, cand_T, cand_vis, cand_sil, cand_shape, cand_cloud, cand_score = best_round
-                sil_gain = float(cand_sil.get("f1", 0.0) - refine_debug.get("silhouette_f1", 0.0))
-                cloud_gain = float(cand_cloud.get("f1", 0.0) - refine_debug.get("cloud_overlap_f1", 0.0))
-                shape_gain = float(cand_shape.get("score", 0.0) - refine_debug.get("shape_score", 0.0))
-                score_margin = 0.0025 if shape_prior_selected else 0.0040
-                min_sil_floor = -0.015 if shape_prior_selected else 0.0
-                min_cloud_floor = -0.010 if shape_prior_selected else 0.0
-                meaningful_gain = (
-                    sil_gain > 0.005
-                    or (shape_prior_selected and (cloud_gain > 0.003 or shape_gain > 0.02))
-                    or ((not shape_prior_selected) and sil_gain >= 0.0 and cloud_gain > 0.010)
-                )
-                sil_ok = (
-                    cand_sil.get("f1", 0.0) >= refine_debug.get("silhouette_f1", 0.0) + min_sil_floor
-                )
-                cloud_ok = (
-                    cand_cloud.get("f1", 0.0) >= refine_debug.get("cloud_overlap_f1", 0.0) + min_cloud_floor
-                )
-                applied = (
-                    cand_score > refine_score + score_margin
-                    and sil_ok
-                    and cloud_ok
-                    and meaningful_gain
-                )
-                round_row = _registration_score_entry(
-                    cand_name,
-                    cand_score,
-                    cand_vis,
-                    cand_sil,
-                    cand_shape,
-                    cand_cloud,
-                    extra={
-                        "stage": "micro_refine",
-                        "round_index": round_idx,
-                        "score_margin": float(score_margin),
-                        "silhouette_gain": float(sil_gain),
-                        "cloud_gain": float(cloud_gain),
-                        "shape_gain": float(shape_gain),
-                        "allow_rotation": bool(allow_micro_rotation),
-                        "silhouette_floor_ok": bool(sil_ok),
-                        "cloud_floor_ok": bool(cloud_ok),
-                        "meaningful_gain": bool(meaningful_gain),
-                        "applied": bool(applied),
-                    },
-                )
-                micro_round_diagnostics.append(round_row)
-                if (
-                    applied
-                ):
-                    refine_T = cand_T
-                    refine_score = cand_score
-                    refine_applied.append(cand_name)
-                    refine_debug = {
-                        **refine_debug,
-                        "shape_enabled": cand_shape.get("enabled", False),
-                        "shape_weight": cand_shape.get("weight", 0.0),
-                        "shape_score": cand_shape.get("score", 0.0),
-                        "shape_confidence": cand_shape.get("confidence", 0.0),
-                        "shape_compatibility": cand_shape.get("compatibility", 0.0),
-                        "shape_center_score": cand_shape.get("center_score", 0.0),
-                        "shape_axis_score": cand_shape.get("axis_score", 0.0),
-                        "shape_size_score": cand_shape.get("size_score", 0.0),
-                        "shape_endpoint_score": cand_shape.get("endpoint_score", 0.0),
-                        "shape_rotation_score": cand_shape.get("rotation_score", 0.0),
-                        "shape_relation_score": cand_shape.get("relation_score", 0.0),
-                        "silhouette_precision": cand_sil["precision"],
-                        "silhouette_recall": cand_sil["recall"],
-                        "silhouette_iou": cand_sil["iou"],
-                        "silhouette_f1": cand_sil["f1"],
-                        "cloud_overlap_enabled": cand_cloud.get("enabled", False),
-                        "cloud_overlap_weight": cand_cloud.get("weight", 0.0),
-                        "cloud_overlap_score": cand_cloud.get("score", 0.0),
-                        "cloud_overlap_precision": cand_cloud.get("precision", 0.0),
-                        "cloud_overlap_recall": cand_cloud.get("recall", 0.0),
-                        "cloud_overlap_f1": cand_cloud.get("f1", 0.0),
-                        "cloud_overlap_chamfer_m": cand_cloud.get("chamfer_m", 0.0),
-                        "cloud_overlap_robust_m": cand_cloud.get("robust_m", 0.0),
-                        "combined_score": cand_score,
-                        "micro_refine_applied": cand_name,
-                    }
-                else:
-                    break
-
-            if refine_applied:
-                best_T = refine_T
-                best_score = refine_score
-                best_init = f"{best_init}+micro_refine"
-                best_reg_debug = refine_debug
-                debug["micro_refine_sequence"] = refine_applied
-            debug["micro_refine_rounds"] = micro_round_diagnostics
-        except Exception as exc:
-            debug["micro_refine_error"] = str(exc)
-    stage_timings["registration / micro refine"] = time.perf_counter() - t_stage
-    stage_timings["registration / total"] = time.perf_counter() - registration_total_start
-
-    debug["best_init"] = best_init
-    debug["best_score"] = best_score
-    debug.update({f"reg_{k}": v for k, v in best_reg_debug.items()})
-    debug["winner_stage_timings_s"] = {
-        label: float(best_reg_debug[key]) / 1000.0
-        for key, label in (
-            ("coarse_ms", "coarse search"),
-            ("fine_ms", "fine search"),
-            ("search_ms", "single-stage search"),
-            ("gicp_ms", "gicp"),
-            ("colored_icp_ms", "colored icp"),
-            ("total_reg_ms", "winner registration total"),
-        )
-        if best_reg_debug.get(key) is not None
-    }
-    debug["focus_stage_timings_s"] = {
-        label: float(value)
-        for label, value in (
-            ("pointcloud build+preprocess", stage_timings.get("pointcloud / total")),
-            ("pcd-fit total", stage_timings.get("pcd fit / total")),
-            ("shape prior total", stage_timings.get("shape prior / total")),
-            ("registration total", stage_timings.get("registration / total")),
-            ("winner registration total", (debug.get("winner_stage_timings_s") or {}).get("winner registration total")),
-        )
-        if value is not None
-    }
-
-    t_stage = time.perf_counter()
-    quality = assess_quality(
-        best_reg_debug.get("gicp_fitness", 0.0),
-        best_reg_debug.get("gicp_inlier_rmse", 1.0),
-    )
-    sil_f1 = best_reg_debug.get("silhouette_f1")
-    sil_iou = best_reg_debug.get("silhouette_iou")
-    if sil_f1 is not None:
-        if sil_f1 < 0.20:
-            quality["quality"] = "poor"
-            quality["reasons"].append(f"very low projected-mask overlap F1 ({sil_f1:.3f})")
-        elif sil_f1 < 0.35 and quality["quality"] != "poor":
-            quality["quality"] = "fair"
-            quality["reasons"].append(f"low projected-mask overlap F1 ({sil_f1:.3f})")
-    if sil_iou is not None and sil_iou < 0.12 and quality["quality"] != "poor":
-        quality["quality"] = "fair"
-        quality["reasons"].append(f"low projected-mask IoU ({sil_iou:.3f})")
-    cloud_f1 = best_reg_debug.get("cloud_overlap_f1")
-    cloud_chamfer = best_reg_debug.get("cloud_overlap_chamfer_m")
-    if cloud_f1 is not None:
-        if cloud_f1 < 0.30:
-            quality["quality"] = "poor"
-            quality["reasons"].append(f"low 3D cloud-overlap F1 ({cloud_f1:.3f})")
-        elif cloud_f1 < 0.45 and quality["quality"] != "poor":
-            quality["quality"] = "fair"
-            quality["reasons"].append(f"moderate 3D cloud-overlap F1 ({cloud_f1:.3f})")
-    if cloud_chamfer is not None:
-        poor_chamfer = max(cfg.voxel_size * 3.2, 0.011)
-        fair_chamfer = max(cfg.voxel_size * 2.2, 0.008)
-        if cloud_chamfer > poor_chamfer:
-            quality["quality"] = "poor"
-            quality["reasons"].append(f"high 3D cloud chamfer ({cloud_chamfer:.4f}m)")
-        elif cloud_chamfer > fair_chamfer and quality["quality"] != "poor":
-            quality["quality"] = "fair"
-            quality["reasons"].append(f"moderate 3D cloud chamfer ({cloud_chamfer:.4f}m)")
-    debug["quality"] = quality
-    debug["t_slip_frame"] = _t_slip_frame_name(mode, T_wrist_to_ee)
-    stage_timings["result / quality assessment"] = time.perf_counter() - t_stage
-
-    # --- Compute T_slip ---
-    t_stage = time.perf_counter()
-    if mode == "world":
-        # T_reg is in base frame; convert to gripper-local slip
-        T_slip = compute_T_slip(best_T, T_wrist_to_ee)
-        new_obb = apply_transform_to_obb(old_obb, best_T) if old_obb is not None else None
-    else:
-        # T_reg is in camera frame; directly interpretable as slip
-        T_slip = compute_T_slip(best_T, T_wrist_to_ee)
-        new_obb = None
-    stage_timings["result / T_slip and OBB"] = time.perf_counter() - t_stage
-
-    elapsed = time.perf_counter() - t_total
-    debug["total_elapsed_s"] = elapsed
-    stage_timings["run_reestimation / total"] = elapsed
-    debug["stage_timings_s"] = stage_timings
-
-    return ReEstimationResult(
-        success=quality["quality"] != "poor",
-        mode=mode,
-        T_registration=best_T,
-        T_slip=T_slip,
-        old_obb=old_obb,
-        new_obb=new_obb,
-        debug=debug,
-        elapsed_s=elapsed,
-    )
-
-
-# ============================================================================
-# Visualization helpers
-# ============================================================================
-
-def _draw_mask_overlay(img_rgb: np.ndarray, mask: np.ndarray, color=(0, 140, 190)) -> np.ndarray:
-    vis = img_rgb.copy()
-    m = np.asarray(mask) > 0
-    if m.ndim == 3:
-        m = m[:, :, 0]
-    overlay = vis.copy()
-    overlay[m] = np.array(color, dtype=np.uint8)
-    return cv2.addWeighted(vis, 0.55, overlay, 0.45, 0)
-
-
-def _draw_detection_overlay(
-    img_rgb: np.ndarray,
-    mask: np.ndarray,
-    bbox: list | None,
-    color=(0, 140, 190),
-    box_color=(0, 255, 0),
-    label: str = "",
-) -> np.ndarray:
-    vis = _draw_mask_overlay(img_rgb, mask, color=color)
-    if bbox:
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        cv2.rectangle(vis, (x1, y1), (x2, y2), box_color, 2)
-        if label:
-            cv2.putText(
-                vis, label, (x1, max(y1 - 6, 14)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv2.LINE_AA,
-            )
-    return vis
-
-
-def _build_context_scene_pcd(
-    rgb: np.ndarray,
-    depth_m: np.ndarray,
-    object_mask: np.ndarray,
-    intr: CameraIntrinsics,
-    voxel_size: float = 0.006,
-):
-    if o3d is None:
-        return None
-
-    obj = np.asarray(object_mask) > 0
-    if obj.ndim == 3:
-        obj = obj[:, :, 0]
-
-    cfg_scene = RegistrationConfig(
-        depth_scale=1000.0,
-        depth_min_m=0.01,
-        depth_max_m=3.0,
-        erode_kernel=1,
-        erode_iters=0,
-        remove_depth_edge_points=False,
-        voxel_size=max(float(voxel_size), 0.006),
-        outlier_nb_neighbors=10,
-        outlier_std_ratio=3.0,
-        radius_outlier_radius=0.0,
-        radius_outlier_min_neighbors=0,
-        iqr_multiplier=0.0,
-    )
-
-    full_mask = np.ones(depth_m.shape[:2], dtype=np.uint8) * 255
-    try:
-        pcd = rgbd_to_pointcloud(rgb, depth_m, full_mask, intr, cfg_scene)
-    except Exception:
-        return None
-
-    if len(pcd.points) == 0:
-        return None
-
-    try:
-        pcd = pcd.voxel_down_sample(cfg_scene.voxel_size)
-    except Exception:
-        pass
-    return pcd
-
-
-def _project_points_to_image(
-    pts_xyz: np.ndarray,
-    intr: CameraIntrinsics,
-    image_hw: tuple[int, int],
-    depth_ref: np.ndarray | None = None,
-    depth_tol_m: float = 0.03,
-) -> np.ndarray:
-    pts = np.asarray(pts_xyz, dtype=np.float64).reshape(-1, 3)
-    if len(pts) == 0:
-        return np.zeros((0, 2), dtype=np.int32)
-
-    z = pts[:, 2]
-    valid = np.isfinite(z) & (z > 1e-4)
-    pts = pts[valid]
-    z = z[valid]
-    if len(pts) == 0:
-        return np.zeros((0, 2), dtype=np.int32)
-
-    u = pts[:, 0] * intr.fx / z + intr.cx
-    v = pts[:, 1] * intr.fy / z + intr.cy
-    ui = np.rint(u).astype(np.int32)
-    vi = np.rint(v).astype(np.int32)
-    h, w = image_hw
-    valid = (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
-    ui, vi, z = ui[valid], vi[valid], z[valid]
-    if len(ui) == 0:
-        return np.zeros((0, 2), dtype=np.int32)
-
-    if depth_ref is not None:
-        d = depth_ref[vi, ui]
-        visible = (d <= 0) | (np.abs(d - z) <= depth_tol_m) | (z <= d + depth_tol_m)
-        ui, vi = ui[visible], vi[visible]
-    if len(ui) == 0:
-        return np.zeros((0, 2), dtype=np.int32)
-    return np.stack([ui, vi], axis=1)
-
-
-def _draw_registration_overlay_2d(
-    after_rgb: np.ndarray,
-    after_mask: np.ndarray,
-    after_depth: np.ndarray,
-    intr: CameraIntrinsics,
-    after_pcd,
-    aligned_pcd,
-) -> np.ndarray:
-    left = _draw_mask_overlay(after_rgb, after_mask, color=(255, 166, 77))
-    right = left.copy()
-
-    m = np.asarray(after_mask) > 0
-    if m.ndim == 3:
-        m = m[:, :, 0]
-    m_u8 = m.astype(np.uint8)
-    edge = m_u8 - cv2.erode(m_u8, np.ones((5, 5), np.uint8), iterations=1)
-    right[edge > 0] = np.array([255, 166, 77], dtype=np.uint8)
-    left[edge > 0] = np.array([255, 166, 77], dtype=np.uint8)
-
-    aligned_pts = np.asarray(aligned_pcd.points)
-    aligned_uv = _project_points_to_image(
-        aligned_pts, intr, after_rgb.shape[:2], depth_ref=after_depth, depth_tol_m=0.035,
-    )
-    if len(aligned_uv) > 2500:
-        idx = np.random.default_rng(42).choice(len(aligned_uv), 2500, replace=False)
-        aligned_uv = aligned_uv[idx]
-
-    for x, y in aligned_uv:
-        cv2.circle(right, (int(x), int(y)), 1, (76, 175, 255), -1, cv2.LINE_AA)
-
-    if len(aligned_uv) >= 3:
-        hull = cv2.convexHull(aligned_uv.reshape(-1, 1, 2).astype(np.int32))
-        cv2.polylines(right, [hull], True, (76, 175, 255), 2, cv2.LINE_AA)
-
-    after_pts = np.asarray(after_pcd.points)
-    if len(after_pts) > 0:
-        after_center = np.median(after_pts.astype(np.float64), axis=0)
-        after_uv = _project_points_to_image(after_center.reshape(1, 3), intr, after_rgb.shape[:2])
-        if len(after_uv) > 0:
-            x, y = after_uv[0]
-            cv2.drawMarker(right, (int(x), int(y)), (255, 166, 77), cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
-            cv2.putText(right, "After", (int(x) + 8, int(y) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 166, 77), 1, cv2.LINE_AA)
-
-    if len(aligned_pts) > 0:
-        aligned_center = np.median(aligned_pts.astype(np.float64), axis=0)
-        aligned_center_uv = _project_points_to_image(aligned_center.reshape(1, 3), intr, after_rgb.shape[:2])
-        if len(aligned_center_uv) > 0:
-            x, y = aligned_center_uv[0]
-            cv2.drawMarker(right, (int(x), int(y)), (76, 175, 255), cv2.MARKER_CROSS, 18, 2, cv2.LINE_AA)
-            cv2.putText(right, "Before aligned", (int(x) + 8, int(y) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (76, 175, 255), 1, cv2.LINE_AA)
-
-    cv2.putText(left, "After target mask", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
-    cv2.putText(right, "After + Before aligned projection", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
-    cv2.putText(right, "Orange = After target, Blue = Before aligned", (14, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 230, 230), 1, cv2.LINE_AA)
-
-    divider = np.full((after_rgb.shape[0], 10, 3), 18, dtype=np.uint8)
-    return np.concatenate([left, divider, right], axis=1)
-
-
-def _projected_mask_alignment_metrics(
-    src_pcd,
-    T_src_to_tgt: np.ndarray,
-    target_mask: np.ndarray,
-    intr: CameraIntrinsics,
-    T_after_cam_to_frame: np.ndarray,
-    depth_ref: np.ndarray | None = None,
-    depth_tol_m: float = 0.035,
-    downsample: int = 4,
-) -> Dict[str, float]:
-    pts_src = np.asarray(src_pcd.points)
-    if len(pts_src) == 0:
-        return {"precision": 0.0, "recall": 0.0, "iou": 0.0, "f1": 0.0, "proj_area": 0.0}
-
-    pts_tgt = transform_points(pts_src, np.asarray(T_src_to_tgt, dtype=np.float64).reshape(4, 4))
-    T_frame_to_cam = invert_transform(np.asarray(T_after_cam_to_frame, dtype=np.float64).reshape(4, 4))
-    pts_cam = transform_points(pts_tgt, T_frame_to_cam)
-    uv = _project_points_to_image(
-        pts_cam, intr, target_mask.shape[:2], depth_ref=depth_ref, depth_tol_m=depth_tol_m,
-    )
-    if len(uv) == 0:
-        return {"precision": 0.0, "recall": 0.0, "iou": 0.0, "f1": 0.0, "proj_area": 0.0}
-
-    ds = max(1, int(downsample))
-    h, w = target_mask.shape[:2]
-    hs = max(1, (h + ds - 1) // ds)
-    ws = max(1, (w + ds - 1) // ds)
-    proj_mask = np.zeros((hs, ws), dtype=np.uint8)
-    uvs = np.column_stack([
-        np.clip(uv[:, 0] // ds, 0, ws - 1),
-        np.clip(uv[:, 1] // ds, 0, hs - 1),
-    ]).astype(np.int32)
-    proj_mask[uvs[:, 1], uvs[:, 0]] = 255
-    if len(uvs) >= 3:
-        hull = cv2.convexHull(uvs.reshape(-1, 1, 2))
-        cv2.fillConvexPoly(proj_mask, hull, 255)
-    proj_mask = cv2.dilate(proj_mask, np.ones((3, 3), np.uint8), iterations=1)
-
-    tgt_mask = (np.asarray(target_mask) > 0).astype(np.uint8)
-    if tgt_mask.ndim == 3:
-        tgt_mask = tgt_mask[:, :, 0]
-    if ds > 1:
-        tgt_mask = cv2.resize(tgt_mask, (ws, hs), interpolation=cv2.INTER_NEAREST)
-    tgt_mask = (tgt_mask > 0).astype(np.uint8)
-
-    proj_bool = proj_mask > 0
-    tgt_bool = tgt_mask > 0
-    overlap = int(np.count_nonzero(proj_bool & tgt_bool))
-    proj_area = int(np.count_nonzero(proj_bool))
-    tgt_area = int(np.count_nonzero(tgt_bool))
-    union = int(np.count_nonzero(proj_bool | tgt_bool))
-
-    precision = overlap / max(proj_area, 1)
-    recall = overlap / max(tgt_area, 1)
-    iou = overlap / max(union, 1)
-    f1 = 0.0 if (precision + recall) <= 1e-9 else (2.0 * precision * recall / (precision + recall))
-    return {
-        "precision": float(precision),
-        "recall": float(recall),
-        "iou": float(iou),
-        "f1": float(f1),
-        "proj_area": float(proj_area),
-    }
-
-
-def _subsample_points_evenly(points: np.ndarray, max_points: int = 900) -> np.ndarray:
-    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    if len(pts) <= max_points:
-        return pts
-    idx = np.linspace(0, len(pts) - 1, max_points).round().astype(np.int64)
-    idx = np.clip(idx, 0, len(pts) - 1)
-    return pts[idx]
-
-
-def _pointcloud_overlap_metrics(
-    src_pcd,
-    tgt_pcd,
-    T_src_to_tgt: np.ndarray,
-    cfg: RegistrationConfig,
-    max_points: int = 900,
-) -> Dict[str, float]:
-    out = {
-        "enabled": False,
-        "weight": 0.0,
-        "score": 0.0,
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1": 0.0,
-        "chamfer_m": 0.0,
-        "robust_m": 0.0,
-        "point_confidence": 0.0,
-    }
-    src_pts = _subsample_points_evenly(np.asarray(src_pcd.points, dtype=np.float64), max_points=max_points)
-    tgt_pts = _subsample_points_evenly(np.asarray(tgt_pcd.points, dtype=np.float64), max_points=max_points)
-    if len(src_pts) < 20 or len(tgt_pts) < 20:
-        return out
-
-    src_t = transform_points(src_pts, np.asarray(T_src_to_tgt, dtype=np.float64).reshape(4, 4))
-    d2 = np.sum((src_t[:, None, :] - tgt_pts[None, :, :]) ** 2, axis=2)
-    nn_src = np.sqrt(np.min(d2, axis=1))
-    nn_tgt = np.sqrt(np.min(d2, axis=0))
-
-    tol = max(float(cfg.voxel_size) * 2.8, 0.0065)
-    precision = float(np.mean(nn_src <= tol))
-    recall = float(np.mean(nn_tgt <= tol))
-    f1 = 0.0 if (precision + recall) <= 1e-9 else float(2.0 * precision * recall / (precision + recall))
-    chamfer = float(0.5 * (float(np.mean(nn_src)) + float(np.mean(nn_tgt))))
-    robust = float(0.5 * (
-        float(np.percentile(nn_src, 85.0)) +
-        float(np.percentile(nn_tgt, 85.0))
-    ))
-    dist_score = float(np.exp(-((chamfer / max(tol * 1.35, 1e-6)) ** 2)))
-    robust_score = float(np.exp(-((robust / max(tol * 1.85, 1e-6)) ** 2)))
-    geom_score = float(0.55 * f1 + 0.30 * dist_score + 0.15 * robust_score)
-    point_conf = float(np.clip(min(len(src_pts), len(tgt_pts)) / 220.0, 0.0, 1.0))
-    weight = float(0.18 * point_conf)
-    out.update({
-        "enabled": True,
-        "weight": weight,
-        "score": geom_score,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "chamfer_m": chamfer,
-        "robust_m": robust,
-        "point_confidence": point_conf,
-    })
-    return out
-
-
-def _combine_registration_scores(
-    visibility_score: float,
-    silhouette_metrics: Dict[str, float],
-    shape_metrics: Dict[str, float] | None = None,
-    cloud_metrics: Dict[str, float] | None = None,
-) -> float:
-    vis = float(visibility_score)
-    sil_f1 = float(silhouette_metrics.get("f1", 0.0))
-    sil_iou = float(silhouette_metrics.get("iou", 0.0))
-    sil_recall = float(silhouette_metrics.get("recall", 0.0))
-    base_score = 0.50 * vis + 0.30 * sil_f1 + 0.10 * sil_iou + 0.10 * sil_recall
-    if cloud_metrics and cloud_metrics.get("enabled"):
-        cloud_weight = float(np.clip(cloud_metrics.get("weight", 0.0), 0.0, 0.18))
-        cloud_score = float(np.clip(cloud_metrics.get("score", 0.0), 0.0, 1.0))
-        base_score = float((1.0 - cloud_weight) * base_score + cloud_weight * cloud_score)
-    if not shape_metrics or not shape_metrics.get("enabled"):
-        return float(base_score)
-    shape_weight = float(np.clip(shape_metrics.get("weight", 0.0), 0.0, 0.22))
-    shape_score = float(np.clip(shape_metrics.get("score", 0.0), 0.0, 1.0))
-    return float((1.0 - shape_weight) * base_score + shape_weight * shape_score)
-
-
-def _registration_score_entry(
-    name: str,
-    combined_score: float,
-    vis_info: Dict[str, Any],
-    sil_info: Dict[str, Any],
-    shape_info: Dict[str, Any],
-    cloud_info: Dict[str, Any],
-    reg_dbg: Dict[str, Any] | None = None,
-    extra: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
-    row: Dict[str, Any] = {
-        "name": name,
-        "combined_score": float(combined_score),
-        "visibility_score": float(vis_info.get("score", 0.0)),
-        "silhouette_f1": float(sil_info.get("f1", 0.0)),
-        "silhouette_iou": float(sil_info.get("iou", 0.0)),
-        "silhouette_precision": float(sil_info.get("precision", 0.0)),
-        "silhouette_recall": float(sil_info.get("recall", 0.0)),
-        "cloud_overlap_enabled": bool(cloud_info.get("enabled", False)),
-        "cloud_overlap_f1": float(cloud_info.get("f1", 0.0)),
-        "cloud_overlap_precision": float(cloud_info.get("precision", 0.0)),
-        "cloud_overlap_recall": float(cloud_info.get("recall", 0.0)),
-        "cloud_overlap_score": float(cloud_info.get("score", 0.0)),
-        "cloud_overlap_weight": float(cloud_info.get("weight", 0.0)),
-        "cloud_overlap_chamfer_m": float(cloud_info.get("chamfer_m", 0.0)),
-        "cloud_overlap_robust_m": float(cloud_info.get("robust_m", 0.0)),
-        "shape_enabled": bool(shape_info.get("enabled", False)),
-        "shape_score": float(shape_info.get("score", 0.0)),
-        "shape_weight": float(shape_info.get("weight", 0.0)),
-        "shape_center_score": float(shape_info.get("center_score", 0.0)),
-        "shape_axis_score": float(shape_info.get("axis_score", 0.0)),
-        "shape_size_score": float(shape_info.get("size_score", 0.0)),
-        "shape_endpoint_score": float(shape_info.get("endpoint_score", 0.0)),
-        "shape_rotation_score": float(shape_info.get("rotation_score", 0.0)),
-        "shape_relation_score": float(shape_info.get("relation_score", 0.0)),
-    }
-    if reg_dbg:
-        if reg_dbg.get("gicp_fitness") is not None:
-            row["gicp_fitness"] = float(reg_dbg.get("gicp_fitness"))
-        if reg_dbg.get("gicp_inlier_rmse") is not None:
-            row["gicp_inlier_rmse_m"] = float(reg_dbg.get("gicp_inlier_rmse"))
-        if reg_dbg.get("colored_icp_fitness") is not None:
-            row["colored_icp_fitness"] = float(reg_dbg.get("colored_icp_fitness"))
-        if reg_dbg.get("colored_icp_inlier_rmse") is not None:
-            row["colored_icp_inlier_rmse_m"] = float(reg_dbg.get("colored_icp_inlier_rmse"))
-    if extra:
-        row.update(extra)
-    return row
-
-
-def _build_detection_debug_text(
-    title: str,
-    det_debug: Dict[str, Any],
-    bbox: list | None,
-    mask: np.ndarray,
-    depth: np.ndarray | None = None,
-) -> str:
-    m = np.asarray(mask) > 0
-    if m.ndim == 3:
-        m = m[:, :, 0]
-    mask_px = int(m.sum())
-    lines = [
-        f"[{title}]",
-        f"source: {det_debug.get('source', '?')}",
-        f"bbox: {bbox}",
-        f"mask_px: {mask_px}",
-    ]
-    if depth is not None:
-        valid_depth = np.asarray(depth) > 0
-        lines.append(f"mask∩depth: {int((m & valid_depth).sum())}")
-    if "qwen_status" in det_debug:
-        lines.append(f"qwen_status: {det_debug.get('qwen_status')}")
-    if det_debug.get("qwen_response"):
-        lines.append(f"qwen_response: {str(det_debug.get('qwen_response'))[:180]}")
-    return "\n".join(lines)
-
-
-def _obb_to_plotly_traces(obb: OBBState, color="lime", name="OBB"):
-    import plotly.graph_objects as go
-    corners = obb.corners_world().astype(np.float64)
-    edges = [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)]
-    lx, ly, lz = [], [], []
-    for a, b in edges:
-        lx += [float(corners[a, 0]), float(corners[b, 0]), None]
-        ly += [float(corners[a, 1]), float(corners[b, 1]), None]
-        lz += [float(corners[a, 2]), float(corners[b, 2]), None]
-    return [go.Scatter3d(x=lx, y=ly, z=lz, mode="lines", line=dict(color=color, width=3), name=name)]
-
-
-def _pcd_to_plotly(pcd, name="Cloud", max_pts=15000, point_size=3.0, opacity=0.9):
-    import plotly.graph_objects as go
-    pts = np.asarray(pcd.points)
-    if len(pts) == 0:
-        return []
-    cols = np.asarray(pcd.colors) if pcd.has_colors() else np.ones_like(pts) * 0.5
-    if len(pts) > max_pts:
-        idx = np.random.default_rng(42).choice(len(pts), max_pts, replace=False)
-        pts, cols = pts[idx], cols[idx]
-    cs = [f"rgb({int(c[0] * 255)},{int(c[1] * 255)},{int(c[2] * 255)})" for c in cols]
-    return [go.Scatter3d(
-        x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], mode="markers",
-        marker=dict(size=point_size, color=cs, opacity=opacity), name=name,
-    )]
-
-
-_3D_LAYOUT = dict(
-    scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Z", aspectmode="data", bgcolor="#f5f7fa"),
-    paper_bgcolor="#fff", margin=dict(l=0, r=0, t=30, b=0), height=520,
-)
-
-
-# ============================================================================
-# Summary text
-# ============================================================================
-
-def _format_duration(seconds: float) -> str:
-    seconds = float(seconds)
-    if not np.isfinite(seconds):
-        return "n/a"
-    ms = seconds * 1000.0
-    if ms < 1000.0:
-        return f"{ms:.1f}ms"
-    return f"{seconds:.3f}s"
-
-
-def _flatten_timing_entries(
-    timings: Dict[str, Any] | None,
-    prefix: str = "",
-) -> list[tuple[str, float]]:
-    if not timings:
-        return []
-    rows: list[tuple[str, float]] = []
-    for key, value in timings.items():
-        label = f"{prefix}{key}" if prefix else str(key)
-        if isinstance(value, dict):
-            rows.extend(_flatten_timing_entries(value, prefix=f"{label} / "))
-            continue
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            continue
-        if np.isfinite(seconds):
-            rows.append((label, seconds))
-    return rows
-
-
-def _build_timing_lines(
-    title: str,
-    timings: Dict[str, Any] | None,
-    limit: int | None = None,
-) -> list[str]:
-    rows = sorted(_flatten_timing_entries(timings), key=lambda item: item[1], reverse=True)
-    if limit is not None:
-        rows = rows[:limit]
-    if not rows:
-        return []
-    lines = [title]
-    for name, seconds in rows:
-        lines.append(f"  {name}: {_format_duration(seconds)}")
-    return lines
-
-
-def _fmt_metric(value: Any, precision: int = 3, suffix: str = "") -> str:
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        return "n/a"
-    if not np.isfinite(val):
-        return "n/a"
-    return f"{val:.{precision}f}{suffix}"
-
-
-def _scale_metric(value: Any, scale: float = 1.0) -> float:
-    try:
-        val = float(value)
-    except (TypeError, ValueError):
-        return float("nan")
-    return val * float(scale) if np.isfinite(val) else float("nan")
-
-
-def _build_key_metric_lines(result: ReEstimationResult) -> list[str]:
-    debug = result.debug or {}
-    q = debug.get("quality", {}) or {}
-    lightglue = debug.get("lightglue_init", {}) or {}
-    lightglue_timings = lightglue.get("timings_s") or {}
-    tapir = debug.get("tapir_init", {}) or {}
-    tapir_timings = tapir.get("timings_s") or {}
-    lines = [
-        "Key metrics:",
-        f"  quality: {str(q.get('quality', '?')).upper()} | mode: {result.mode} | elapsed: {result.elapsed_s:.2f}s",
-        f"  candidate mode: {debug.get('init_candidate_mode', 'auto')}",
-        f"  best init: {debug.get('best_init', '?')}",
-        f"  combined score: {_fmt_metric(debug.get('best_score'))}",
-        (
-            "  projected mask:"
-            f" F1={_fmt_metric(debug.get('reg_silhouette_f1'))}"
-            f" IoU={_fmt_metric(debug.get('reg_silhouette_iou'))}"
-            f" P={_fmt_metric(debug.get('reg_silhouette_precision'))}"
-            f" R={_fmt_metric(debug.get('reg_silhouette_recall'))}"
-        ),
-        (
-            "  cloud overlap:"
-            f" enabled={bool(debug.get('reg_cloud_overlap_enabled'))}"
-            f" F1={_fmt_metric(debug.get('reg_cloud_overlap_f1'))}"
-            f" P={_fmt_metric(debug.get('reg_cloud_overlap_precision'))}"
-            f" R={_fmt_metric(debug.get('reg_cloud_overlap_recall'))}"
-            f" chamfer={_fmt_metric(_scale_metric(debug.get('reg_cloud_overlap_chamfer_m'), 1000.0), 1, 'mm')}"
-            f" robust={_fmt_metric(_scale_metric(debug.get('reg_cloud_overlap_robust_m'), 1000.0), 1, 'mm')}"
-        ),
-        (
-            "  ICP:"
-            f" GICP fitness={_fmt_metric(debug.get('reg_gicp_fitness'))}"
-            f" RMSE={_fmt_metric(_scale_metric(debug.get('reg_gicp_inlier_rmse'), 1000.0), 2, 'mm')}"
-            f" colored fitness={_fmt_metric(debug.get('reg_colored_icp_fitness'))}"
-            f" colored RMSE={_fmt_metric(_scale_metric(debug.get('reg_colored_icp_inlier_rmse'), 1000.0), 2, 'mm')}"
-        ),
-        (
-            "  shape prior:"
-            f" enabled={bool(debug.get('reg_shape_weight', 0.0) > 1e-6)}"
-            f" score={_fmt_metric(debug.get('reg_shape_score'))}"
-            f" center={_fmt_metric(debug.get('reg_shape_center_score'))}"
-            f" axis={_fmt_metric(debug.get('reg_shape_axis_score'))}"
-            f" weight={_fmt_metric(debug.get('reg_shape_weight'))}"
-        ),
-        (
-            "  LightGlue:"
-            f" enabled={bool(lightglue.get('enabled'))}"
-            f" success={bool(lightglue.get('success'))}"
-            f" candidate_added={bool(lightglue.get('candidate_added'))}"
-            f" scope={lightglue.get('match_scope', '-')}"
-            f" kptsMax={lightglue.get('max_keypoints', '-')}"
-            f" img0={lightglue.get('before_match_shape', '-')}"
-            f" raw={lightglue.get('num_matches', 0)}"
-            f" roi={lightglue.get('num_roi_matches', 0)}"
-            f" near={lightglue.get('num_roi_near_mask_matches', 0)}"
-            f" valid3d={lightglue.get('num_valid_3d_matches', 0)}"
-            f" inliers={lightglue.get('num_inliers', 0)}"
-            f" nearIn={lightglue.get('num_near_mask_inliers', 0)}"
-            f" ratio={_fmt_metric(lightglue.get('inlier_ratio'))}"
-            f" nearRatio={_fmt_metric(lightglue.get('near_mask_inlier_ratio'))}"
-            f" projNear={_fmt_metric(lightglue.get('object_projection_near_mask_ratio'))}"
-            f" rmse={_fmt_metric(_scale_metric(lightglue.get('ransac_rmse_m'), 1000.0), 2, 'mm')}"
-            f" mode={lightglue.get('acceptance_mode', '-')}"
-            f" smallFallback={bool(lightglue.get('small_sample_fallback_used'))}"
-        ),
-        (
-            "  LightGlue timing:"
-            f" total={_format_duration(lightglue_timings.get('total', float('nan')))}"
-            f" load={_format_duration(lightglue_timings.get('load_models', float('nan')))}"
-            f" crop={_format_duration(lightglue_timings.get('crop', float('nan')))}"
-            f" tensor={_format_duration(lightglue_timings.get('to_tensor', float('nan')))}"
-            f" superpoint={_format_duration(lightglue_timings.get('superpoint_extract', float('nan')))}"
-            f" match={_format_duration(lightglue_timings.get('lightglue_match', float('nan')))}"
-            f" filter={_format_duration(lightglue_timings.get('filter_matches', float('nan')))}"
-            f" ransac={_format_duration(lightglue_timings.get('ransac_3d', float('nan')))}"
-        ),
-        (
-            "  TAPIR:"
-            f" enabled={bool(tapir.get('enabled'))}"
-            f" success={bool(tapir.get('success'))}"
-            f" candidate_added={bool(tapir.get('candidate_added'))}"
-            f" backend={tapir.get('backend', '-')}"
-            f" raw={tapir.get('num_matches', 0)}"
-            f" valid3d={tapir.get('num_valid_3d_matches', 0)}"
-            f" inliers={tapir.get('num_inliers', 0)}"
-            f" ratio={_fmt_metric(tapir.get('inlier_ratio'))}"
-            f" rmse={_fmt_metric(_scale_metric(tapir.get('ransac_rmse_m'), 1000.0), 2, 'mm')}"
-        ),
-        (
-            "  TAPIR timing:"
-            f" total={_format_duration(tapir_timings.get('total', float('nan')))}"
-            f" sample={_format_duration(tapir_timings.get('sample_queries', float('nan')))}"
-            f" track={_format_duration(tapir_timings.get('track', float('nan')))}"
-            f" filter={_format_duration(tapir_timings.get('filter_tracks', float('nan')))}"
-            f" ransac={_format_duration(tapir_timings.get('ransac_3d', float('nan')))}"
-        ),
-    ]
-    pca_frame = debug.get("pca_frame_init", {}) or {}
-    if pca_frame:
-        lines.append(
-            "  PCA frame init:"
-            f" version={pca_frame.get('version', '-')}"
-            f" added={int(pca_frame.get('num_candidates_added', 0) or 0)}"
-            f" candidates={','.join(str(v) for v in (pca_frame.get('candidate_names') or []))}"
-        )
-    pcd_ransac = debug.get("pcd_fpfh_ransac", {}) or {}
-    silhouette_init = debug.get("silhouette_init", {}) or {}
-    silhouette_rows = silhouette_init.get("diagnostics") or []
-    best_silhouette = silhouette_rows[0] if silhouette_rows else {}
-    silhouette_subclasses = silhouette_init.get("subclasses") or {}
-    lines.append(
-        "  Silhouette init:"
-        f" enabled={bool(silhouette_init.get('enabled'))}"
-        f" added={int(silhouette_init.get('num_candidates_added', 0) or 0)}"
-        f" coarse={len(silhouette_subclasses.get('coarse') or [])}"
-        f" sweep={len(silhouette_subclasses.get('sweep') or [])}"
-        f" best={best_silhouette.get('name', '-')}"
-        f" F1={_fmt_metric(best_silhouette.get('f1'))}"
-        f" IoU={_fmt_metric(best_silhouette.get('iou'))}"
-        f" preScore={_fmt_metric(best_silhouette.get('pre_score'))}"
-    )
-    lines.append(
-        "  PCD RANSAC:"
-        f" enabled={bool(pcd_ransac.get('enabled'))}"
-        f" success={bool(pcd_ransac.get('success'))}"
-        f" fitness={_fmt_metric(pcd_ransac.get('fitness'))}"
-        f" rmse={_fmt_metric(_scale_metric(pcd_ransac.get('inlier_rmse'), 1000.0), 2, 'mm')}"
-        f" srcDown={int(pcd_ransac.get('src_down_points', 0) or 0)}"
-        f" tgtDown={int(pcd_ransac.get('tgt_down_points', 0) or 0)}"
-        f" voxel={_fmt_metric(_scale_metric(pcd_ransac.get('voxel_size'), 1000.0), 1, 'mm')}"
-    )
-    t_vec = np.asarray(result.T_slip, dtype=np.float64)[:3, 3]
-    lines.append(
-        "  T_slip trans:"
-        f" [{t_vec[0]:.4f}, {t_vec[1]:.4f}, {t_vec[2]:.4f}]m"
-        f" norm={np.linalg.norm(t_vec):.4f}m"
-    )
-    stage = debug.get("stage_timings_s") or {}
-    focus = debug.get("focus_stage_timings_s") or {}
-    core_total = _scale_metric(debug.get("total_elapsed_s"), 1.0)
-    core_hz = (1.0 / core_total) if np.isfinite(core_total) and core_total > 1e-9 else float("nan")
-    lines.append(
-        "  runtime:"
-        f" core={_format_duration(core_total)}"
-        f" (~{_fmt_metric(core_hz, 2, 'Hz')})"
-        f" pointcloud={_format_duration(stage.get('pointcloud / total', float('nan')))}"
-        f" pcdFit={_format_duration(stage.get('pcd fit / total', float('nan')))}"
-        f" silInit={_format_duration(stage.get('silhouette init / projection search', float('nan')))}"
-        f" pcdRansac={_format_duration(stage.get('pcd ransac / fpfh', float('nan')))}"
-        f" lightglue={_format_duration(stage.get('lightglue init / superpoint-lightglue', float('nan')))}"
-        f" tapir={_format_duration(stage.get('tapir init / tapir', float('nan')))}"
-        f" registration={_format_duration(stage.get('registration / total', float('nan')))}"
-        f" winnerReg={_format_duration((debug.get('winner_stage_timings_s') or {}).get('winner registration total', float('nan')))}"
-    )
-    if focus:
-        lines.append(
-            "  runtime focus:"
-            f" pcd+pre={_format_duration(focus.get('pointcloud build+preprocess', float('nan')))}"
-            f" shapePrior={_format_duration(stage.get('shape prior / total', float('nan')))}"
-            f" allCandidates={_format_duration(stage.get('registration / all init candidates', float('nan')))}"
-        )
-    lines.extend(_build_candidate_metric_lines(debug))
-    return lines
-
-
-def _build_candidate_metric_lines(debug: Dict[str, Any], limit: int | None = None) -> list[str]:
-    rows = debug.get("init_diagnostics") or []
-    if not rows:
-        return ["", "Candidate metrics:", "  n/a"]
-    ordered = sorted(rows, key=lambda row: float(row.get("combined_score", -1e9)), reverse=True)
-    if limit is not None:
-        ordered = ordered[:limit]
-    def _cell(value: Any, precision: int = 3, scale: float = 1.0, width: int = 7) -> str:
-        try:
-            val = float(value) * float(scale)
-        except (TypeError, ValueError):
-            return "n/a".rjust(width)
-        if not np.isfinite(val):
-            return "n/a".rjust(width)
-        return f"{val:.{precision}f}".rjust(width)
-
-    name_width = max(18, min(42, max(len(str(row.get("name", "?"))) for row in ordered)))
-    lines = ["", f"Candidate metrics ({len(rows)} total, sorted by combined score):"]
-    lines.append(
-        "  "
-        f"{'#':>2} "
-        f"{'candidate':<{name_width}} "
-        f"{'score':>7} "
-        f"{'vis':>7} "
-        f"{'silF1':>7} "
-        f"{'IoU':>7} "
-        f"{'cloudF1':>7} "
-        f"{'cham(mm)':>8} "
-        f"{'shape':>7} "
-        f"{'gFit':>7} "
-        f"{'gRMSE(mm)':>9}"
-    )
-    lines.append(
-        "  "
-        + "-" * (
-            3 + name_width + 8 * 7 + 9 + 10
-        )
-    )
-    for rank, row in enumerate(ordered, start=1):
-        name = row.get("name", "?")
-        lines.append(
-            "  "
-            f"{rank:>2} "
-            f"{str(name):<{name_width}} "
-            f"{_cell(row.get('combined_score'))} "
-            f"{_cell(row.get('visibility_score'))} "
-            f"{_cell(row.get('silhouette_f1'))} "
-            f"{_cell(row.get('silhouette_iou'))} "
-            f"{_cell(row.get('cloud_overlap_f1'))} "
-            f"{_cell(row.get('cloud_overlap_chamfer_m'), precision=1, scale=1000.0, width=8)} "
-            f"{_cell(row.get('shape_score'))} "
-            f"{_cell(row.get('gicp_fitness'))} "
-            f"{_cell(row.get('gicp_inlier_rmse_m'), precision=2, scale=1000.0, width=9)}"
-        )
-    return lines
-
-
-def _build_summary(
-    result: ReEstimationResult,
-    s2m2_before_ms: int = 0, s2m2_after_ms: int = 0,
-    sam3_before_ms: int = 0, sam3_after_ms: int = 0,
-    pipeline_timings: Dict[str, Any] | None = None,
-) -> str:
-    lines = []
-    q = result.debug.get("quality", {})
-    lines.append(f"{'═' * 50}")
-    lines.append(f"  模式: {'世界坐标系 (world)' if result.mode == 'world' else '相机坐标系 (camera)'}")
-    lines.append(f"  配准质量: {q.get('quality', '?').upper()}")
-    for r in q.get("reasons", []):
-        lines.append(f"    - {r}")
-    lines.append(f"  总耗时: {result.elapsed_s:.3f}s")
-    lines.append(f"  最佳初始化: {result.debug.get('best_init', '?')}")
-    initial_best = result.debug.get("initial_best_init")
-    if initial_best and initial_best != result.debug.get("best_init"):
-        lines.append(f"  初始赢家: {initial_best}")
-    lightglue_info = result.debug.get("lightglue_init") or {}
-    if lightglue_info.get("enabled"):
-        lines.append(
-            "  SuperPoint-LightGlue:"
-            f" {'OK' if lightglue_info.get('success') else 'FAILED'},"
-            f" matches={lightglue_info.get('num_matches', 0)},"
-            f" roi={lightglue_info.get('num_roi_matches', 0)},"
-            f" valid3d={lightglue_info.get('num_valid_3d_matches', 0)},"
-            f" inliers={lightglue_info.get('num_inliers', 0)},"
-            f" ratio={lightglue_info.get('inlier_ratio', 0.0):.3f},"
-            f" mode={lightglue_info.get('acceptance_mode', '-')},"
-            f" hybrids={len(lightglue_info.get('hybrid_candidates') or [])},"
-            f" candidate_added={bool(lightglue_info.get('candidate_added'))}"
-        )
-        if lightglue_info.get("error") or lightglue_info.get("reason"):
-            lines.append(f"    {lightglue_info.get('error') or lightglue_info.get('reason')}")
-    lines.append(f"{'═' * 50}")
-    lines.append("")
-    lines.extend(_build_key_metric_lines(result))
-
-    lines.append("")
-    lines.append("服务调用耗时:")
-    lines.append(f"  S2M2 (before): {s2m2_before_ms}ms")
-    lines.append(f"  S2M2 (after):  {s2m2_after_ms}ms")
-    lines.append(f"  SAM3 (before): {sam3_before_ms}ms")
-    lines.append(f"  SAM3 (after):  {sam3_after_ms}ms")
-
-    lines.append("")
-    lines.append("点云信息:")
-    lines.append(f"  Before 点数: {result.debug.get('before_points', '?')}")
-    lines.append(f"  After 点数:  {result.debug.get('after_points', '?')}")
-    if not result.debug.get("pcd_fit_enabled", True):
-        lines.append("  PCD-fit: 已关闭 (跳过 primitive fit / shape prior)")
-
-    focus_timing_lines = _build_timing_lines("核心耗时:", result.debug.get("focus_stage_timings_s"))
-    if focus_timing_lines:
-        lines.append("")
-        lines.extend(focus_timing_lines)
-
-    # Init errors
-    init_errors = {k: v for k, v in result.debug.items() if k.startswith("init_") and k.endswith("_error")}
-    if init_errors:
-        lines.append("")
-        lines.append("初始化错误:")
-        for k, v in init_errors.items():
-            name = k.replace("init_", "").replace("_error", "")
-            lines.append(f"  {name}: {v}")
-
-    lines.append("")
-    lines.append("配准耗时:")
-    found_timing = False
-    for key in ["coarse_ms", "fine_ms", "search_ms", "gicp_ms", "colored_icp_ms"]:
-        val = result.debug.get(f"reg_{key}")
-        if val is not None:
-            lines.append(f"  {key}: {val}ms")
-            found_timing = True
-    if not found_timing:
-        lines.append("  (无配准数据 — 所有初始化均失败)")
-
-    lines.append("")
-    lines.append("ICP 指标:")
-    gicp_f = result.debug.get("reg_gicp_fitness")
-    gicp_r = result.debug.get("reg_gicp_inlier_rmse")
-    if gicp_f is not None:
-        lines.append(f"  GICP fitness: {gicp_f:.4f}")
-        lines.append(f"  GICP RMSE:    {gicp_r:.6f}m" if gicp_r is not None else "  GICP RMSE:    ?")
-    else:
-        lines.append("  (无 ICP 数据 — 配准未完成)")
-    c = result.debug.get("reg_colored_icp_fitness")
-    if c is not None:
-        lines.append(f"  Colored ICP fitness: {c}")
-        lines.append(f"  Colored ICP RMSE:    {result.debug.get('reg_colored_icp_inlier_rmse')}")
-    axis_w = result.debug.get("reg_axis_prior_weight")
-    if axis_w is not None and axis_w > 1e-6:
-        lines.append(
-            "  Elongated-object prior:"
-            f" w={axis_w:.3f}, axis={result.debug.get('reg_axis_alignment_score', 0.0):.3f},"
-            f" center={result.debug.get('reg_axis_center_score', 0.0):.3f},"
-            f" length={result.debug.get('reg_axis_length_score', 0.0):.3f}"
-        )
-    sil_f1 = result.debug.get("reg_silhouette_f1")
-    if sil_f1 is not None:
-        lines.append(
-            "  Projected mask overlap:"
-            f" F1={sil_f1:.3f}, IoU={result.debug.get('reg_silhouette_iou', 0.0):.3f},"
-            f" P={result.debug.get('reg_silhouette_precision', 0.0):.3f},"
-            f" R={result.debug.get('reg_silhouette_recall', 0.0):.3f}"
-        )
-    if result.debug.get("reg_cloud_overlap_enabled"):
-        lines.append(
-            "  3D cloud overlap:"
-            f" F1={result.debug.get('reg_cloud_overlap_f1', 0.0):.3f},"
-            f" P={result.debug.get('reg_cloud_overlap_precision', 0.0):.3f},"
-            f" R={result.debug.get('reg_cloud_overlap_recall', 0.0):.3f},"
-            f" chamfer={1000.0 * result.debug.get('reg_cloud_overlap_chamfer_m', 0.0):.1f}mm"
-        )
-    if result.debug.get("shape_before_fit") or result.debug.get("shape_after_fit"):
-        lines.append("")
-        lines.append("形状拟合:")
-        shape_pair_info = result.debug.get("shape_prior_pair") or {}
-        if shape_pair_info.get("selected"):
-            lines.append(
-                "  Shape prior pair:"
-                f" src={shape_pair_info.get('source_type')},"
-                f" tgt={shape_pair_info.get('target_type')},"
-                f" mode={shape_pair_info.get('selection_mode')},"
-                f" compat={shape_pair_info.get('compatibility', 0.0):.3f},"
-                f" conf={shape_pair_info.get('confidence', 0.0):.3f}"
-            )
-            if (
-                shape_pair_info.get("source_type") != shape_pair_info.get("source_best_type")
-                or shape_pair_info.get("target_type") != shape_pair_info.get("target_best_type")
-            ):
-                lines.append(
-                    "  Shape prior fallback:"
-                    f" best=({shape_pair_info.get('source_best_type')}->{shape_pair_info.get('target_best_type')}),"
-                    f" selected=({shape_pair_info.get('source_type')}->{shape_pair_info.get('target_type')})"
-                )
-            src_variants = shape_pair_info.get("source_variants") or []
-            if src_variants:
-                lines.append(
-                    "  Source variants: "
-                    + " | ".join(
-                        f"{row.get('type')}#r{row.get('rank')} res={row.get('residual', 0.0):.5f} conf={row.get('confidence', 0.0):.3f}"
-                        for row in src_variants[:3]
-                    )
-                )
-            tgt_variants = shape_pair_info.get("target_variants") or []
-            if tgt_variants:
-                lines.append(
-                    "  Target variants: "
-                    + " | ".join(
-                        f"{row.get('type')}#r{row.get('rank')} res={row.get('residual', 0.0):.5f} conf={row.get('confidence', 0.0):.3f}"
-                        for row in tgt_variants[:3]
-                    )
-                )
-            pair_candidates = shape_pair_info.get("candidate_pairs") or []
-            if pair_candidates:
-                lines.append("  Shape pair candidates:")
-                for row in pair_candidates[:3]:
-                    lines.append(
-                        "    "
-                        f"{row.get('source_type')}->{row.get('target_type')}: "
-                        f"pair={row.get('pair_score', 0.0):.3f}, "
-                        f"compat={row.get('compatibility', 0.0):.3f}, "
-                        f"conf={row.get('confidence', 0.0):.3f}, "
-                        f"scale={row.get('scale_score', 0.0):.3f}, "
-                        f"rank=({row.get('source_variant_rank')},{row.get('target_variant_rank')})"
-                    )
-        if result.debug.get("shape_before_fit"):
-            for line in summarize_fit_result_lines(result.debug.get("shape_before_fit"), prefix="  Before"):
-                lines.append(f"  {line}" if not line.startswith("  ") else line)
-        if result.debug.get("shape_after_fit"):
-            for line in summarize_fit_result_lines(result.debug.get("shape_after_fit"), prefix="  After"):
-                lines.append(f"  {line}" if not line.startswith("  ") else line)
-        if result.debug.get("shape_before_fit_error"):
-            lines.append(f"  Before fit error: {result.debug.get('shape_before_fit_error')}")
-        if result.debug.get("shape_after_fit_error"):
-            lines.append(f"  After fit error: {result.debug.get('shape_after_fit_error')}")
-        shape_w = result.debug.get("reg_shape_weight")
-        if shape_w is not None and shape_w > 1e-6:
-            lines.append(
-                "  Shape prior:"
-                f" w={shape_w:.3f}, score={result.debug.get('reg_shape_score', 0.0):.3f},"
-                f" center={result.debug.get('reg_shape_center_score', 0.0):.3f},"
-                f" axis={result.debug.get('reg_shape_axis_score', 0.0):.3f}"
-            )
-        relation_info = result.debug.get("shape_relation_info") or {}
-        if relation_info.get("available"):
-            lines.append(
-                "  M3 endpoint cue:"
-                f" pref={relation_info.get('preferred_relation')},"
-                f" conf={relation_info.get('confidence', 0.0):.3f},"
-                f" same={relation_info.get('same_score', 0.0):.3f},"
-                f" reversed={relation_info.get('reversed_score', 0.0):.3f}"
-            )
-        if result.debug.get("reg_m3_flip_applied"):
-            lines.append("  M3 flip correction: applied")
-        if result.debug.get("reg_shape_snap_applied"):
-            lines.append(f"  Shape center snap: {result.debug.get('reg_shape_snap_applied')}")
-        if result.debug.get("reg_micro_refine_applied"):
-            lines.append(f"  Metric micro-refine: {result.debug.get('reg_micro_refine_applied')}")
-        snap_rows = result.debug.get("shape_snap_diagnostics") or []
-        if snap_rows:
-            lines.append("  Shape snap candidates:")
-            for row in snap_rows[:3]:
-                tag = "*" if row.get("applied") else ("+" if row.get("is_best_shape_snap") else "-")
-                lines.append(
-                    "    "
-                    f"{tag} {row.get('name')}: total={row.get('combined_score', 0.0):.3f}, "
-                    f"sil={row.get('silhouette_f1', 0.0):.3f}, "
-                    f"cloud={row.get('cloud_overlap_f1', 0.0):.3f}, "
-                    f"shape={row.get('shape_score', 0.0):.3f}, "
-                    f"move={1000.0 * row.get('translation_delta_m', 0.0):.1f}mm"
-                )
-        micro_gate = result.debug.get("micro_refine_gate") or {}
-        if micro_gate:
-            lines.append(
-                "  Micro gate:"
-                f" seed={micro_gate.get('strong_pose_seed')},"
-                f" need={micro_gate.get('need_micro_refine')},"
-                f" sil={micro_gate.get('current_silhouette_f1', 0.0):.3f},"
-                f" cloud={micro_gate.get('current_cloud_overlap_f1', 0.0):.3f},"
-                f" shape={micro_gate.get('current_shape_score', 0.0):.3f},"
-                f" rot={micro_gate.get('allow_micro_rotation')}"
-            )
-        micro_rows = result.debug.get("micro_refine_rounds") or []
-        if micro_rows:
-            lines.append("  Micro refine rounds:")
-            for row in micro_rows[:3]:
-                tag = "*" if row.get("applied") else "-"
-                lines.append(
-                    "    "
-                    f"{tag} r{1 + int(row.get('round_index', 0))} {row.get('name')}: "
-                    f"total={row.get('combined_score', 0.0):.3f}, "
-                    f"dSil={row.get('silhouette_gain', 0.0):+.3f}, "
-                    f"dCloud={row.get('cloud_gain', 0.0):+.3f}, "
-                    f"dShape={row.get('shape_gain', 0.0):+.3f}"
-                )
-
-    timing_groups = [
-        ("阶段耗时 Top:", {
-            **(pipeline_timings or {}),
-            **(result.debug.get("stage_timings_s") or {}),
-            **({
-                f"winner / {k}": v
-                for k, v in (result.debug.get("winner_stage_timings_s") or {}).items()
-            }),
-        }),
-        ("外层流程耗时:", pipeline_timings),
-        ("Re-Estimation 内部耗时:", result.debug.get("stage_timings_s")),
-        ("最佳候选配准耗时:", result.debug.get("winner_stage_timings_s")),
-    ]
-    for idx, (title, timing_dict) in enumerate(timing_groups):
-        timing_lines = _build_timing_lines(title, timing_dict, limit=10 if idx == 0 else None)
-        if timing_lines:
-            lines.append("")
-            lines.extend(timing_lines)
-
-    init_rows = result.debug.get("init_diagnostics") or []
-    if init_rows:
-        lines.append("")
-        lines.append("初始化候选 Top:")
-        for row in init_rows[:5]:
-            lines.append(
-                f"  {row.get('name')}: "
-                f"total={row.get('combined_score', 0.0):.3f}, "
-                f"vis={row.get('visibility_score', 0.0):.3f}, "
-                f"sil={row.get('silhouette_f1', 0.0):.3f}, "
-                f"cloud={row.get('cloud_overlap_f1', 0.0):.3f}, "
-                f"shape={row.get('shape_score', 0.0):.3f}"
-            )
-
-    frame_name = result.debug.get("t_slip_frame", "camera" if result.mode == "camera" else "base")
-    frame_label = {"camera": "相机系", "ee": "夹爪/末端系", "base": "base系"}.get(frame_name, frame_name)
-    lines.append("")
-    lines.append(f"T_slip ({frame_label}下的物体相对运动):")
-    t = result.T_slip[:3, 3]
-    try:
-        lines.append(f"  平移: [{t[0]:.5f}, {t[1]:.5f}, {t[2]:.5f}] m")
-        lines.extend(_t_slip_rotation_lines(result.T_slip, frame_name, compact=False))
-    except ImportError:
-        lines.append(f"  平移: [{t[0]:.5f}, {t[1]:.5f}, {t[2]:.5f}] m")
-
-    if result.mode == "world" and result.old_obb is not None and result.new_obb is not None:
-        lines.append("")
-        lines.append("OBB 变化 (base 系):")
-        oc, nc = result.old_obb.center_base, result.new_obb.center_base
-        lines.append(f"  旧 center: [{oc[0]:.4f}, {oc[1]:.4f}, {oc[2]:.4f}]")
-        lines.append(f"  新 center: [{nc[0]:.4f}, {nc[1]:.4f}, {nc[2]:.4f}]")
-        lines.append(f"  偏移: {np.linalg.norm(nc - oc):.4f}m")
-    elif result.mode == "camera":
-        lines.append("")
-        lines.append("提示: camera 模式不输出 base 系 OBB。")
-        lines.append("  后续使用 T_slip 时:")
-        lines.append("  new_obb = G_current @ T_slip @ G_at_pick⁻¹ @ old_obb")
-
-    return "\n".join(lines)
-
-
-# ============================================================================
-# Parse helpers
-# ============================================================================
-
-def _parse_intrinsic_file(file_path: str) -> Dict[str, float]:
-    """
-    Parse camera intrinsic file.
-    Format:
-        # fx fy cx cy baseline(m)
-        220.066284 215.175922 319.828328 178.033516 0.035018
-    """
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        parts = stripped.split()
-        if len(parts) >= 5:
-            return {
-                "fx": float(parts[0]),
-                "fy": float(parts[1]),
-                "cx": float(parts[2]),
-                "cy": float(parts[3]),
-                "baseline": float(parts[4]),
-            }
-    raise ValueError(f"Cannot parse intrinsic file: expected '# fx fy cx cy baseline(m)' header + values line")
-
-
-def _parse_matrix(text: str) -> np.ndarray | None:
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        return np.array(json.loads(text), dtype=np.float64)
-    except json.JSONDecodeError:
-        vals = [float(v) for v in text.replace(",", " ").split()]
-        n = len(vals)
-        if n == 16:
-            return np.array(vals, dtype=np.float64).reshape(4, 4)
-        if n == 9:
-            return np.array(vals, dtype=np.float64).reshape(3, 3)
-        if n == 3:
-            return np.array(vals, dtype=np.float64).reshape(3)
-        raise ValueError(f"Cannot parse matrix from {n} values")
-
-
-# ============================================================================
-# Gradio callback
-# ============================================================================
-
-def run_pipeline_gradio(
-    before_left, before_right,
-    after_left, after_right,
-    intrinsic_file,
-    cam_to_base_before_str, cam_to_base_after_str,
-    T_wrist_to_ee_str,
-    obb_center_str, obb_axes_str, obb_size_str,
-    object_name,
-    use_coarse_fine, enable_pcd_fit, voxel_size, gicp_max_corr, use_colored_icp,
-    depth_scale,
-    sam3_url, s2m2_url,
-):
-    N_OUT = 18
-    empty = None
-    pipeline_total_start = time.perf_counter()
-    pipeline_timings: Dict[str, float] = {}
-
-    # Partial results accumulator — always try to show what we computed so far
-    partial = {
-        "summary": "", "before_mask_vis": None, "after_mask_vis": None,
-        "before_depth_vis": None, "after_depth_vis": None,
-        "fig_scene_before": None, "fig_scene_after": None,
-        "fig_reg_before": None, "fig_reg_after": None, "fig_3d": None,
-        "T_slip_str": "", "T_reg_str": "", "raw_json": "",
-        "status": "运行中...",
-        "T_slip_json": None, "new_obb_json": None, "T_reg_json": None,
-        "download_files": None,
-    }
-
-    def _make_depth_colormap(depth_m: np.ndarray) -> np.ndarray:
-        valid = np.isfinite(depth_m) & (depth_m > 0)
-        if not valid.any():
-            return np.zeros((*depth_m.shape, 3), dtype=np.uint8)
-        d_min, d_max = depth_m[valid].min(), depth_m[valid].max()
-        if d_max - d_min < 1e-6:
-            d_max = d_min + 1.0
-        norm = np.zeros_like(depth_m, dtype=np.uint8)
-        norm[valid] = ((depth_m[valid] - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-        colored = cv2.applyColorMap(norm, cv2.COLORMAP_TURBO)
-        return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
-
-    def _make_depth_mask_diag(depth_m: np.ndarray, mask: np.ndarray, label: str) -> np.ndarray:
-        """Depth colormap with mask contour overlaid + stats text."""
-        vis = _make_depth_colormap(depth_m)
-        m = (np.asarray(mask) > 0)
-        if m.ndim == 3:
-            m = m[:, :, 0]
-        contours, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(vis, contours, -1, (255, 255, 0), 2)
-        valid_d = np.isfinite(depth_m) & (depth_m > 0)
-        overlap = int((m & valid_d).sum())
-        mask_px = int(m.sum())
-        depth_px = int(valid_d.sum())
-        d_in_m = depth_m[m]
-        finite_in_m = d_in_m[np.isfinite(d_in_m) & (d_in_m > 0)]
-        if len(finite_in_m) > 0:
-            d_info = f"depth_in_mask: {finite_in_m.min():.3f}~{finite_in_m.max():.3f}m"
-        else:
-            d_info = "depth_in_mask: NONE"
-        stats = f"{label} | mask:{mask_px} depth:{depth_px} overlap:{overlap} | {d_info}"
-        cv2.putText(vis, stats, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(vis, f"depth shape: {depth_m.shape}", (5, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
-        return vis
-
-    def _returns():
-        return (
-            partial["summary"], partial["before_mask_vis"], partial["after_mask_vis"],
-            partial["before_depth_vis"], partial["after_depth_vis"],
-            partial["fig_scene_before"], partial["fig_scene_after"],
-            partial["fig_reg_before"], partial["fig_reg_after"], partial["fig_3d"],
-            partial["T_slip_str"], partial["T_reg_str"], partial["raw_json"],
-            partial["status"],
-            partial["T_slip_json"], partial["new_obb_json"], partial["T_reg_json"],
-            partial["download_files"],
-        )
-
-    try:
-        if before_left is None or before_right is None:
-            partial["summary"] = "请上传抓取前的左右目图像"
-            partial["status"] = "缺少输入"
-            return _returns()
-        if after_left is None or after_right is None:
-            partial["summary"] = "请上传抓取后的左右目图像"
-            partial["status"] = "缺少输入"
-            return _returns()
-
-        h, w = before_left.shape[:2]
-
-        if intrinsic_file is None:
-            partial["summary"] = "请上传相机内参文件 (.txt)"
-            partial["status"] = "缺少内参文件"
-            return _returns()
-
-        t_stage = time.perf_counter()
-        intr = _parse_intrinsic_file(str(intrinsic_file))
-        fx, fy, cx, cy, baseline = intr["fx"], intr["fy"], intr["cx"], intr["cy"], intr["baseline"]
-        K = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, width=w, height=h)
-        pipeline_timings["input / parse intrinsics"] = time.perf_counter() - t_stage
-
-        # --- S2M2 depth estimation ---
-        t0 = time.perf_counter()
-        before_depth_raw = call_s2m2_depth(
-            before_left, before_right, fx, fy, cx, cy, baseline, s2m2_url.strip(),
-        )
-        s2m2_before_ms = int((time.perf_counter() - t0) * 1000)
-        pipeline_timings["service / S2M2 before"] = s2m2_before_ms / 1000.0
-
-        t0 = time.perf_counter()
-        after_depth_raw = call_s2m2_depth(
-            after_left, after_right, fx, fy, cx, cy, baseline, s2m2_url.strip(),
-        )
-        s2m2_after_ms = int((time.perf_counter() - t0) * 1000)
-        pipeline_timings["service / S2M2 after"] = s2m2_after_ms / 1000.0
-
-        t_stage = time.perf_counter()
-        before_depth = depth_to_meters(before_depth_raw, target_hw=(h, w))
-        after_h, after_w = after_left.shape[:2]
-        after_depth = depth_to_meters(after_depth_raw, target_hw=(after_h, after_w))
-        pipeline_timings["depth / normalize to meters"] = time.perf_counter() - t_stage
-
-        # --- Qwen detection + SAM3 segmentation ---
-        obj_prompt = object_name.strip() if object_name and object_name.strip() else None
-        t0 = time.perf_counter()
-        before_mask, before_bbox_used, before_det_debug = detect_and_segment(
-            before_left, text_prompt=obj_prompt, sam3_url=sam3_url.strip(),
-        )
-        sam3_before_ms = int((time.perf_counter() - t0) * 1000)
-        pipeline_timings["service / detect+segment before"] = sam3_before_ms / 1000.0
-
-        t0 = time.perf_counter()
-        after_mask, after_bbox_used, after_det_debug = detect_and_segment(
-            after_left, text_prompt=obj_prompt, sam3_url=sam3_url.strip(),
-        )
-        sam3_after_ms = int((time.perf_counter() - t0) * 1000)
-        pipeline_timings["service / detect+segment after"] = sam3_after_ms / 1000.0
-
-        # --- Build mask visualizations (always, even if registration fails) ---
-        t_stage = time.perf_counter()
-        before_mask_vis = _draw_mask_overlay(before_left, before_mask, color=(0, 180, 0))
-        if before_bbox_used:
-            x1, y1, x2, y2 = [int(v) for v in before_bbox_used]
-            cv2.rectangle(before_mask_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(before_mask_vis, before_det_debug.get("source", ""), (x1, max(y1 - 6, 14)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
-        partial["before_mask_vis"] = before_mask_vis
-
-        after_mask_vis = _draw_mask_overlay(after_left, after_mask, color=(0, 140, 190))
-        if after_bbox_used:
-            x1, y1, x2, y2 = [int(v) for v in after_bbox_used]
-            cv2.rectangle(after_mask_vis, (x1, y1), (x2, y2), (0, 128, 255), 2)
-            cv2.putText(after_mask_vis, after_det_debug.get("source", ""), (x1, max(y1 - 6, 14)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 128, 255), 1, cv2.LINE_AA)
-        partial["after_mask_vis"] = after_mask_vis
-
-        # --- Depth diagnostics (always) ---
-        partial["before_depth_vis"] = _make_depth_mask_diag(before_depth, before_mask, "Before")
-        partial["after_depth_vis"] = _make_depth_mask_diag(after_depth, after_mask, "After")
-        pipeline_timings["visual / mask + depth diagnostics"] = time.perf_counter() - t_stage
-
-        # --- Scene point cloud (always, before/after separate) ---
-        t_stage = time.perf_counter()
-        try:
-            import plotly.graph_objects as go
-
-            def _build_scene_fig(rgb, depth_m, msk, K_intr, title, edge_color="lime", max_scene=40000):
-                traces = []
-                rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8) if rgb.dtype != np.uint8 else rgb
-                valid = np.isfinite(depth_m) & (depth_m > 0.01) & (depth_m < 5.0)
-                m = (msk > 0) if msk.ndim == 2 else (msk[:, :, 0] > 0)
-
-                # Background (outside mask): small, semi-transparent
-                bg = valid & ~m
-                bys, bxs = np.nonzero(bg)
-                if len(bys) > 0:
-                    max_bg = max_scene
-                    if len(bys) > max_bg:
-                        idx = np.random.default_rng(42).choice(len(bys), max_bg, replace=False)
-                        bys, bxs = bys[idx], bxs[idx]
-                    bzv = depth_m[bys, bxs].astype(np.float64)
-                    bxv = (bxs.astype(np.float64) - K_intr.cx) / K_intr.fx * bzv
-                    byv = (bys.astype(np.float64) - K_intr.cy) / K_intr.fy * bzv
-                    bcs = [f"rgb({rgb_u8[y,x,0]},{rgb_u8[y,x,1]},{rgb_u8[y,x,2]})" for y, x in zip(bys, bxs)]
-                    traces.append(go.Scatter3d(
-                        x=bxv, y=byv, z=bzv, mode="markers",
-                        marker=dict(size=1.0, color=bcs, opacity=0.4), name="背景",
-                    ))
-
-                # Object interior: RGB colored, slightly larger
-                obj_valid = m & valid
-                oys, oxs = np.nonzero(obj_valid)
-                if len(oys) > 0:
-                    ozv = depth_m[oys, oxs].astype(np.float64)
-                    oxv = (oxs.astype(np.float64) - K_intr.cx) / K_intr.fx * ozv
-                    oyv = (oys.astype(np.float64) - K_intr.cy) / K_intr.fy * ozv
-                    ocs = [f"rgb({rgb_u8[y,x,0]},{rgb_u8[y,x,1]},{rgb_u8[y,x,2]})" for y, x in zip(oys, oxs)]
-                    traces.append(go.Scatter3d(
-                        x=oxv, y=oyv, z=ozv, mode="markers",
-                        marker=dict(size=2.0, color=ocs, opacity=0.9),
-                        name=f"物体 ({len(oys)}pts)",
-                    ))
-
-                # Mask edge contour: bright color ring
-                m_u8 = m.astype(np.uint8)
-                eroded = cv2.erode(m_u8, np.ones((5, 5), np.uint8), iterations=1)
-                edge = (m_u8 > 0) & (eroded == 0) & valid
-                eys, exs = np.nonzero(edge)
-                if len(eys) > 0:
-                    max_edge = 3000
-                    if len(eys) > max_edge:
-                        idx = np.random.default_rng(7).choice(len(eys), max_edge, replace=False)
-                        eys, exs = eys[idx], exs[idx]
-                    ezv = depth_m[eys, exs].astype(np.float64)
-                    exv = (exs.astype(np.float64) - K_intr.cx) / K_intr.fx * ezv
-                    eyv = (eys.astype(np.float64) - K_intr.cy) / K_intr.fy * ezv
-                    traces.append(go.Scatter3d(
-                        x=exv, y=eyv, z=ezv, mode="markers",
-                        marker=dict(size=3.5, color=edge_color, opacity=1.0),
-                        name=f"Mask 边缘 ({len(eys)}pts)",
-                    ))
-
-                fig = go.Figure(data=traces)
-                fig.update_layout(title=title, **_3D_LAYOUT)
-                return fig
-
-            partial["fig_scene_before"] = _build_scene_fig(
-                before_left, before_depth, before_mask, K, "Before 场景点云", edge_color="lime",
-            )
-            partial["fig_scene_after"] = _build_scene_fig(
-                after_left, after_depth, after_mask, K, "After 场景点云", edge_color="orange",
-            )
-        except Exception:
-            pass
-        pipeline_timings["visual / scene plots"] = time.perf_counter() - t_stage
-
-        diag_lines = []
-        diag_lines.append(f"S2M2 before raw shape: {before_depth_raw.shape}, dtype: {before_depth_raw.dtype}")
-        diag_lines.append(f"S2M2 after  raw shape: {after_depth_raw.shape}, dtype: {after_depth_raw.dtype}")
-        diag_lines.append(f"Depth before (meters): shape={before_depth.shape}, valid={int((before_depth > 0).sum())}, range=[{before_depth[before_depth > 0].min() if (before_depth > 0).any() else 0:.4f}, {before_depth.max():.4f}]")
-        diag_lines.append(f"Depth after  (meters): shape={after_depth.shape}, valid={int((after_depth > 0).sum())}, range=[{after_depth[after_depth > 0].min() if (after_depth > 0).any() else 0:.4f}, {after_depth.max():.4f}]")
-        diag_lines.append(f"Before mask pixels: {int((before_mask > 0).sum())}, bbox: {before_bbox_used}")
-        diag_lines.append(f"After  mask pixels: {int((after_mask > 0).sum())}, bbox: {after_bbox_used}")
-        bm = before_mask > 0 if before_mask.ndim == 2 else before_mask[:, :, 0] > 0
-        am = after_mask > 0 if after_mask.ndim == 2 else after_mask[:, :, 0] > 0
-        diag_lines.append(f"Before mask∩depth: {int((bm & (before_depth > 0)).sum())}")
-        diag_lines.append(f"After  mask∩depth: {int((am & (after_depth > 0)).sum())}")
-        diag_lines.append(f"S2M2 耗时: before={s2m2_before_ms}ms, after={s2m2_after_ms}ms")
-        diag_lines.append(f"检测+分割耗时: before={sam3_before_ms}ms, after={sam3_after_ms}ms")
-        partial["summary"] = "\n".join(diag_lines)
-
-        # --- Parse optional matrices ---
-        t_stage = time.perf_counter()
-        T_before = _parse_matrix(cam_to_base_before_str)
-        T_after = _parse_matrix(cam_to_base_after_str)
-        T_we = _parse_matrix(T_wrist_to_ee_str)
-
-        old_obb = None
-        if obb_center_str.strip() and obb_size_str.strip():
-            axes_raw = _parse_matrix(obb_axes_str) if obb_axes_str.strip() else np.eye(3, dtype=np.float64)
-            old_obb = OBBState(
-                center_base=_parse_matrix(obb_center_str).reshape(3),
-                axes_base=axes_raw.reshape(3, 3),
-                size_xyz=_parse_matrix(obb_size_str).reshape(3),
-            )
-        pipeline_timings["input / parse optional transforms"] = time.perf_counter() - t_stage
-
-        cfg = RegistrationConfig(
-            depth_scale=float(depth_scale),
-            voxel_size=float(voxel_size),
-            gicp_max_corr_dist=float(gicp_max_corr),
-            use_colored_icp=bool(use_colored_icp),
-        )
-
-        # --- Run registration ---
-        t_stage = time.perf_counter()
-        result = run_reestimation(
-            before_rgb=before_left,
-            before_depth=before_depth,
-            before_mask=before_mask,
-            after_rgb=after_left,
-            after_depth=after_depth,
-            after_mask=after_mask,
-            K_wrist=K,
-            T_cam_to_base_before=T_before,
-            T_cam_to_base_after=T_after,
-            T_wrist_to_ee=T_we,
-            old_obb=old_obb,
-            use_coarse_fine=bool(use_coarse_fine),
-            enable_pcd_fit=bool(enable_pcd_fit),
-            cfg=cfg,
-        )
-        pipeline_timings["pipeline / run_reestimation"] = time.perf_counter() - t_stage
-        for name, seconds in (result.debug.get("focus_stage_timings_s") or {}).items():
-            pipeline_timings[f"core / {name}"] = float(seconds)
-
-        # --- 3D registration result (separate before/after + merged) ---
-        t_stage = time.perf_counter()
-        try:
-            import plotly.graph_objects as go
-            from plotly.subplots import make_subplots
-            cfg2 = RegistrationConfig(voxel_size=float(voxel_size))
-            bp = rgbd_to_pointcloud(before_left, before_depth, before_mask, K, cfg2)
-            bp = preprocess_pcd(bp, cfg2)
-            ap = rgbd_to_pointcloud(after_left, after_depth, after_mask, K, cfg2)
-            ap = preprocess_pcd(ap, cfg2)
-            if T_before is not None and T_after is not None:
-                bp_vis = copy_pcd(bp); bp_vis.transform(np.asarray(T_before, dtype=np.float64).reshape(4, 4))
-                ap_vis = copy_pcd(ap); ap_vis.transform(np.asarray(T_after, dtype=np.float64).reshape(4, 4))
-            else:
-                bp_vis, ap_vis = copy_pcd(bp), copy_pcd(ap)
-            aligned = copy_pcd(bp_vis)
-            aligned.transform(result.T_registration)
-
-            def _pcd_uniform_trace(pcd, name, color, size=3.5, opacity=0.9):
-                pts = np.asarray(pcd.points)
-                if len(pts) == 0:
-                    return []
-                return [go.Scatter3d(
-                    x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], mode="markers",
-                    marker=dict(size=size, color=color, opacity=opacity), name=name,
-                )]
-
-            # Before aligned (standalone, RGB colors)
-            fig_before = go.Figure(data=_pcd_to_plotly(aligned, "Before (配准后)", point_size=3.5))
-            fig_before.update_layout(title="Before 物体 (配准后位置) — RGB 颜色", **_3D_LAYOUT)
-            partial["fig_reg_before"] = fig_before
-
-            # After (standalone, RGB colors)
-            fig_after = go.Figure(data=_pcd_to_plotly(ap_vis, "After", point_size=3.5))
-            fig_after.update_layout(title="After 物体 — RGB 颜色", **_3D_LAYOUT)
-            partial["fig_reg_after"] = fig_after
-
-            # Merged overlay — fixed colors so you can tell them apart
-            # Blue = Before (配准后), Red = After
-            traces = _pcd_uniform_trace(aligned, "Before (配准后) — 蓝色", color="dodgerblue", size=3.0, opacity=0.8)
-            traces += _pcd_uniform_trace(ap_vis, "After — 红色", color="red", size=3.0, opacity=0.8)
-            if result.old_obb:
-                traces += _obb_to_plotly_traces(result.old_obb, "lime", "Pre-grasp OBB")
-            if result.new_obb:
-                traces += _obb_to_plotly_traces(result.new_obb, "orange", "Post-grasp OBB")
-            partial["fig_3d"] = go.Figure(data=traces)
-            partial["fig_3d"].update_layout(
-                title="配准叠加: 蓝=Before(配准后), 红=After — 重合=配准成功, 分离=配准失败",
-                **_3D_LAYOUT,
-            )
-        except Exception:
-            pass
-        pipeline_timings["visual / registration plots"] = time.perf_counter() - t_stage
-
-        # --- Save PLY files for download ---
-        dl_dir: str | None = None
-        dl_files: list[str] | None = None
-        t_stage = time.perf_counter()
-        try:
-            dl_dir = tempfile.mkdtemp(prefix="pose_inhand_dl_")
-            dl_files = []
-
-            def _save_ply(pcd, name):
-                path = os.path.join(dl_dir, name)
-                o3d.io.write_point_cloud(path, pcd)
-                dl_files.append(path)
-
-            # Scene point clouds (full, cleaned)
-            cfg_clean = RegistrationConfig(
-                depth_scale=float(depth_scale), voxel_size=float(voxel_size),
-                depth_min_m=0.01, depth_max_m=5.0,
-            )
-
-            def _full_scene_pcd(rgb, depth_m, K_intr):
-                h_d, w_d = depth_m.shape[:2]
-                full_mask = np.ones((h_d, w_d), dtype=np.uint8) * 255
-                K_full = CameraIntrinsics(fx=K_intr.fx, fy=K_intr.fy, cx=K_intr.cx, cy=K_intr.cy, width=w_d, height=h_d)
-                pcd = rgbd_to_pointcloud(rgb, depth_m, full_mask, K_full, cfg_clean)
-                return preprocess_pcd(pcd, cfg_clean)
-
-            try:
-                scene_before = _full_scene_pcd(before_left, before_depth, K)
-                _save_ply(scene_before, "scene_before.ply")
-            except Exception:
-                pass
-            try:
-                scene_after = _full_scene_pcd(after_left, after_depth, K)
-                _save_ply(scene_after, "scene_after.ply")
-            except Exception:
-                pass
-
-            # Object-only point clouds
-            try:
-                obj_before = rgbd_to_pointcloud(before_left, before_depth, before_mask, K, cfg)
-                obj_before = preprocess_pcd(obj_before, cfg)
-                _save_ply(obj_before, "object_before.ply")
-            except Exception:
-                pass
-            try:
-                obj_after = rgbd_to_pointcloud(after_left, after_depth, after_mask, K, cfg)
-                obj_after = preprocess_pcd(obj_after, cfg)
-                _save_ply(obj_after, "object_after.ply")
-            except Exception:
-                pass
-
-            # Aligned object (after registration)
-            try:
-                obj_b = rgbd_to_pointcloud(before_left, before_depth, before_mask, K, cfg)
-                obj_b = preprocess_pcd(obj_b, cfg)
-                obj_b.transform(result.T_registration)
-                obj_b.paint_uniform_color([1.0, 0.3, 0.3])
-                obj_a = rgbd_to_pointcloud(after_left, after_depth, after_mask, K, cfg)
-                obj_a = preprocess_pcd(obj_a, cfg)
-                merged = o3d.geometry.PointCloud()
-                merged.points = o3d.utility.Vector3dVector(
-                    np.vstack([np.asarray(obj_b.points), np.asarray(obj_a.points)]))
-                merged.colors = o3d.utility.Vector3dVector(
-                    np.vstack([np.asarray(obj_b.colors), np.asarray(obj_a.colors)]))
-                _save_ply(merged, "aligned_merged.ply")
-            except Exception:
-                pass
-            partial["download_files"] = dl_files if dl_files else None
-        except Exception:
-            partial["download_files"] = None
-            dl_dir = None
-            dl_files = None
-        pipeline_timings["export / pointcloud files"] = time.perf_counter() - t_stage
-
-        partial["T_slip_str"] = np.array2string(result.T_slip, precision=6, suppress_small=True)
-        partial["T_reg_str"] = np.array2string(result.T_registration, precision=6, suppress_small=True)
-        partial["T_slip_json"] = result.T_slip.tolist()
-        partial["new_obb_json"] = result.new_obb.to_dict() if result.new_obb else None
-        partial["T_reg_json"] = result.T_registration.tolist()
-
-        def _build_result_payload() -> Dict[str, Any]:
-            return {
-                "success": result.success,
-                "mode": result.mode,
-                "elapsed_s": result.elapsed_s,
-                "quality": result.debug.get("quality"),
-                "T_slip": result.T_slip.tolist(),
-                "T_registration": result.T_registration.tolist(),
-                "old_obb": result.old_obb.to_dict() if result.old_obb else None,
-                "new_obb": result.new_obb.to_dict() if result.new_obb else None,
-                "detection_before": before_det_debug,
-                "detection_after": after_det_debug,
-                "timings": {
-                    "s2m2_before_ms": s2m2_before_ms,
-                    "s2m2_after_ms": s2m2_after_ms,
-                    "detect_seg_before_ms": sam3_before_ms,
-                    "detect_seg_after_ms": sam3_after_ms,
-                    "pipeline_stage_timings_s": pipeline_timings,
-                    "reestimation_stage_timings_s": result.debug.get("stage_timings_s"),
-                    "winner_registration_stage_timings_s": result.debug.get("winner_stage_timings_s"),
-                },
-            }
-
-        t_stage = time.perf_counter()
-        partial["raw_json"] = json.dumps(_build_result_payload(), indent=2, ensure_ascii=False, default=str)
-        pipeline_timings["serialize / raw json"] = time.perf_counter() - t_stage
-        t_stage = time.perf_counter()
-        if dl_dir and dl_files is not None:
-            json_path = os.path.join(dl_dir, "result.json")
-            with open(json_path, "w") as jf:
-                jf.write(partial["raw_json"] or "{}")
-            dl_files.append(json_path)
-
-            if dl_files:
-                zip_path = os.path.join(dl_dir, "all_results.zip")
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for f in dl_files:
-                        zf.write(f, os.path.basename(f))
-                dl_files.append(zip_path)
-            partial["download_files"] = dl_files if dl_files else None
-        pipeline_timings["export / package json+zip"] = time.perf_counter() - t_stage
-        pipeline_timings["pipeline / total"] = time.perf_counter() - pipeline_total_start
-        partial["raw_json"] = json.dumps(_build_result_payload(), indent=2, ensure_ascii=False, default=str)
-
-        partial["summary"] = _build_summary(
-            result,
-            s2m2_before_ms,
-            s2m2_after_ms,
-            sam3_before_ms,
-            sam3_after_ms,
-            pipeline_timings=pipeline_timings,
-        )
-
-        q_info = result.debug.get("quality", {})
-        partial["status"] = f"完成 | {q_info.get('quality', '?').upper()} | 模式: {result.mode} | 耗时 {result.elapsed_s:.2f}s"
-
-        return _returns()
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        partial["summary"] = f"Pipeline 失败:\n{e}\n\n{tb}\n\n--- 已有诊断信息 ---\n{partial['summary']}"
-        partial["status"] = f"失败: {e}"
-        return _returns()
-
-
-# ============================================================================
-# Gradio UI
-# ============================================================================
-
-def build_app():
-    if gr is None:
-        raise ImportError("gradio is required for web UI. Use --local/--local-files or install gradio.")
-    with gr.Blocks(title="Post-Grasp In-Hand Pose Re-Estimation") as app:
-
-        gr.Markdown("# Post-Grasp In-Hand Pose Re-Estimation", elem_id="app-title")
-
-        with gr.Row(equal_height=False):
-
-            # ── Left: Inputs ──
-            with gr.Column(scale=3, min_width=380):
-
-                # ───── 模式选择（最顶部） ─────
-                mode_radio = gr.Radio(
-                    label="工作模式",
-                    choices=["camera 模式 (无外参, 输出 T_slip)", "world 模式 (有外参, 输出新 OBB)"],
-                    value="camera 模式 (无外参, 输出 T_slip)",
-                )
-
-                # ───── 目标物体名称 ─────
-                object_name = gr.Textbox(
-                    label="目标物体名称 (用于 Qwen 检测 → SAM3 分割)",
-                    placeholder="e.g. pen, white card, 笔, 螺丝刀",
-                    max_lines=1,
-                )
-
-                # ───── 图像输入 ─────
-                with gr.Accordion("抓取前 双目图像", open=True):
-                    with gr.Row():
-                        before_left = gr.Image(label="抓取前 左图", type="numpy", height=150)
-                        before_right = gr.Image(label="抓取前 右图", type="numpy", height=150)
-
-                with gr.Accordion("抓取后 双目图像", open=True):
-                    with gr.Row():
-                        after_left = gr.Image(label="抓取后 左图", type="numpy", height=150)
-                        after_right = gr.Image(label="抓取后 右图", type="numpy", height=150)
-
-                # ───── 相机内参 ─────
-                intrinsic_file = gr.File(
-                    label="上传内参文件 (.txt, 格式: # fx fy cx cy baseline(m))",
-                    file_types=[".txt"], type="filepath",
-                )
-                intrinsic_status = gr.Textbox(label="解析结果", interactive=False, lines=1)
-
-                # ───── 配准参数 ─────
-                with gr.Accordion("配准参数", open=False):
-                    with gr.Row():
-                        depth_scale = gr.Number(label="Depth Scale", value=1.0, precision=1)
-                        voxel_size = gr.Number(label="Voxel Size (m)", value=0.0015, precision=4)
-                    with gr.Row():
-                        gicp_max_corr = gr.Number(label="GICP Max Corr (m)", value=0.01, precision=4)
-                        use_colored_icp = gr.Checkbox(label="Colored ICP", value=True)
-                    use_coarse_fine = gr.Checkbox(label="Coarse-to-Fine 搜索 (扩大范围到±90°)", value=True)
-                    enable_pcd_fit = gr.State(True)
-
-                # ───── World 模式专属参数 ─────
-                with gr.Accordion("外参 cam_to_base (world 模式)", open=False, visible=False) as extrinsic_group:
-                    cam_to_base_before_str = gr.Textbox(
-                        label="抓取前 cam_to_base (4x4 JSON)", value="", max_lines=2,
-                    )
-                    cam_to_base_after_str = gr.Textbox(
-                        label="抓取后 cam_to_base (4x4 JSON)", value="", max_lines=2,
-                    )
-
-                with gr.Accordion("手眼标定 T_wrist_to_ee (可选)", open=False):
-                    gr.Markdown("相机到末端执行器的固定变换。留空则 T_slip = T_reg")
-                    T_wrist_to_ee_str = gr.Textbox(label="T_wrist_to_ee (4x4)", value="", max_lines=2)
-
-                with gr.Accordion("OBB (world 模式, 可选)", open=False, visible=False) as obb_group:
-                    gr.Markdown("world 模式下，配合 OBB 数据输出更新后的 base 系 OBB")
-                    obb_center_str = gr.Textbox(label="center_base [x,y,z]", value="", max_lines=1)
-                    obb_axes_str = gr.Textbox(label="axes_base 3x3 (留空=单位阵)", value="", max_lines=1)
-                    obb_size_str = gr.Textbox(label="size_xyz [L,W,H]", value="", max_lines=1)
-
-                # ───── 服务地址 ─────
-                with gr.Accordion("服务地址", open=False):
-                    sam3_url = gr.Textbox(label="SAM3 URL", value=DEFAULT_SAM3_URL, max_lines=1)
-                    s2m2_url = gr.Textbox(label="S2M2 URL", value=DEFAULT_S2M2_URL, max_lines=1)
-
-            # ── Right: Results ──
-            with gr.Column(scale=5, min_width=600):
-
-                run_btn = gr.Button("运行 Re-Estimation", variant="primary", size="lg")
-                status_bar = gr.Textbox(label="状态", value="就绪", interactive=False, max_lines=1)
-
-                with gr.Tabs():
-                    with gr.Tab("概览"):
-                        summary_text = gr.Textbox(
-                            label="结果摘要", lines=32, interactive=False,
-                            elem_classes=["summary-box"],
-                        )
-
-                    with gr.Tab("Mask + Depth 诊断"):
-                        gr.Markdown("**Mask overlay** (bbox + 分割) 和 **Depth colormap** (mask 轮廓叠加, 黄色=mask边界)")
-                        with gr.Row():
-                            before_mask_vis = gr.Image(label="Before: Mask", height=280)
-                            after_mask_vis = gr.Image(label="After: Mask", height=280)
-                        with gr.Row():
-                            before_depth_vis = gr.Image(label="Before: Depth + Mask 轮廓", height=280)
-                            after_depth_vis = gr.Image(label="After: Depth + Mask 轮廓", height=280)
-
-                    with gr.Tab("场景点云 (配准前)"):
-                        gr.Markdown("全场景 + 物体高亮（绿=物体）。上下分开显示 Before / After")
-                        plot_scene_before = gr.Plot(label="Before 场景点云")
-                        plot_scene_after = gr.Plot(label="After 场景点云")
-
-                    with gr.Tab("3D 配准结果"):
-                        gr.Markdown("上方分别展示 Before/After 物体原始形状，下方叠加显示（重合=配准成功）")
-                        with gr.Row():
-                            plot_reg_before = gr.Plot(label="Before 物体 (配准后)")
-                            plot_reg_after = gr.Plot(label="After 物体")
-                        plot_3d = gr.Plot(label="配准叠加")
-
-                    with gr.Tab("T_slip / T_reg"):
-                        T_slip_text = gr.Textbox(
-                            label="T_slip (物体在夹爪系的滑动, 4x4)", lines=6, interactive=False,
-                        )
-                        T_reg_text = gr.Textbox(
-                            label="T_registration (配准变换, 4x4)", lines=6, interactive=False,
-                        )
-
-                    with gr.Tab("输出数据"):
-                        with gr.Row():
-                            T_slip_json = gr.JSON(label="T_slip (可复制)")
-                            new_obb_json = gr.JSON(label="新 OBB (仅 world 模式)")
-                        T_reg_json = gr.JSON(label="T_registration")
-
-                    with gr.Tab("下载"):
-                        gr.Markdown(
-                            "点击文件名下载。包含：场景点云 PLY、物体点云 PLY、配准后合并点云 PLY、结果 JSON。"
-                            "  \n用 **MeshLab / CloudCompare** 打开 PLY 文件查看。"
-                        )
-                        download_files = gr.File(label="可下载文件", file_count="multiple")
-
-                    with gr.Tab("原始 JSON"):
-                        raw_json = gr.Code(label="完整输出", language="json", lines=30)
-
-        # ── Mode switch → show/hide world-mode panels ──
-        def _on_mode_change(mode):
-            is_world = "world" in mode
-            return gr.update(visible=is_world, open=is_world), gr.update(visible=is_world)
-
-        mode_radio.change(
-            fn=_on_mode_change,
-            inputs=[mode_radio],
-            outputs=[extrinsic_group, obb_group],
-        )
-
-        # ── Intrinsic file upload → show parsed info ──
-        def _on_intrinsic_upload(file_path):
-            if file_path is None:
-                return "未上传"
-            try:
-                intr = _parse_intrinsic_file(str(file_path))
-                return f"fx={intr['fx']:.4f}  fy={intr['fy']:.4f}  cx={intr['cx']:.4f}  cy={intr['cy']:.4f}  baseline={intr['baseline']:.6f}m"
-            except Exception as e:
-                return f"解析失败: {e}"
-
-        intrinsic_file.change(
-            fn=_on_intrinsic_upload,
-            inputs=[intrinsic_file],
-            outputs=[intrinsic_status],
-        )
-
-        # ── Wire up ──
-        run_btn.click(
-            fn=run_pipeline_gradio,
-            inputs=[
-                before_left, before_right,
-                after_left, after_right,
-                intrinsic_file,
-                cam_to_base_before_str, cam_to_base_after_str,
-                T_wrist_to_ee_str,
-                obb_center_str, obb_axes_str, obb_size_str,
-                object_name,
-                use_coarse_fine, enable_pcd_fit, voxel_size, gicp_max_corr, use_colored_icp,
-                depth_scale,
-                sam3_url, s2m2_url,
-            ],
-            outputs=[
-                summary_text, before_mask_vis, after_mask_vis,
-                before_depth_vis, after_depth_vis,
-                plot_scene_before, plot_scene_after,
-                plot_reg_before, plot_reg_after, plot_3d,
-                T_slip_text, T_reg_text, raw_json,
-                status_bar,
-                T_slip_json, new_obb_json, T_reg_json,
-                download_files,
-            ],
-        )
-
-    return app
-
-
-# ============================================================================
-# Local CLI mode (tkinter software renderer, same style as pointcloud_viewer.py)
-# ============================================================================
-
-class _LocalResultViewer:
-    """Lightweight tkinter viewer with clearer registration views."""
-
-    BG_RGB = (12, 18, 24)
-    BEFORE_RGB = np.array([70, 205, 255], dtype=np.float32) / 255.0
-    AFTER_RGB = np.array([255, 186, 56], dtype=np.float32) / 255.0
-    BEFORE_ORIG_RGB = np.array([120, 255, 150], dtype=np.float32) / 255.0
-    TRAIL_RGB = (150, 235, 255)
-    OBJECT_MAX_PTS = 22000
-    SCENE_MAX_PTS = 14000
-
-    def __init__(self, before_pcd, after_pcd, aligned_pcd, after_scene_pcd=None, info_text: str = "", parent=None):
-        import tkinter as _tk
-        from PIL import ImageTk as _ImageTk
-
-        self._tk = _tk
-        self._ImageTk = _ImageTk
-
-        self.before_pts = np.asarray(before_pcd.points).astype(np.float32)
-        self.after_pts = np.asarray(after_pcd.points).astype(np.float32)
-        self.aligned_pts = np.asarray(aligned_pcd.points).astype(np.float32)
-        self.before_pts = self._subsample(self.before_pts, self.OBJECT_MAX_PTS)
-        self.after_pts = self._subsample(self.after_pts, self.OBJECT_MAX_PTS)
-        self.aligned_pts = self._subsample(self.aligned_pts, self.OBJECT_MAX_PTS)
-
-        focus_obj = self._stack_nonempty(self.after_pts, self.aligned_pts)
-        self.object_center = self._centroid(focus_obj)
-        self.object_diag = max(self._diag(focus_obj), 0.035)
-
-        if after_scene_pcd is not None and len(after_scene_pcd.points) > 0:
-            scene_pts = np.asarray(after_scene_pcd.points).astype(np.float32)
-            if after_scene_pcd.has_colors():
-                scene_cols = np.asarray(after_scene_pcd.colors).astype(np.float32)
-            else:
-                scene_cols = np.ones_like(scene_pts, dtype=np.float32) * 0.65
-            scene_pts, scene_cols = self._prepare_scene_context(scene_pts, scene_cols)
-            self.after_scene_pts, self.after_scene_cols = self._subsample_points_colors(
-                scene_pts, scene_cols, self.SCENE_MAX_PTS
-            )
-        else:
-            self.after_scene_pts = np.zeros((0, 3), dtype=np.float32)
-            self.after_scene_cols = np.zeros((0, 3), dtype=np.float32)
-
-        self.before_center = self._centroid(self.before_pts)
-        self.after_center = self._centroid(self.after_pts)
-        self.aligned_center = self._centroid(self.aligned_pts)
-
-        self.yaw = 0.0
-        self.pitch = 0.0
-        self.zoom = 1.0
-        self.drag_last = None
-        self.show_mode = 0
-        self.info_text = info_text
-        self._standalone = parent is None
-
-        if parent is not None:
-            self.root = _tk.Toplevel(parent)
-        else:
-            self.root = _tk.Tk()
-        self.root.title("In-Hand Pose Registration Viewer")
-        self.root.geometry("1320x860")
-
-        ctrl = _tk.Frame(self.root)
-        ctrl.pack(side="top", fill="x", padx=8, pady=4)
-        _tk.Label(ctrl, text="View:").pack(side="left")
-        self.mode_var = _tk.StringVar(value="After Scene")
-        modes = ["After Scene", "Object Overlap", "Motion Compare"]
-        _tk.OptionMenu(ctrl, self.mode_var, *modes, command=self._on_mode_change).pack(side="left", padx=4)
-        _tk.Label(ctrl, text="  drag rotate, wheel zoom").pack(side="left", padx=12)
-
-        self.canvas = _tk.Canvas(self.root, bg="#0e141c", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda _: self._render())
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<MouseWheel>", self._on_wheel)
-        self.canvas.bind("<Button-4>", self._on_wheel)
-        self.canvas.bind("<Button-5>", self._on_wheel)
-
-        self.photo = None
-        self.image_id = None
-
-    @staticmethod
-    def _subsample(pts: np.ndarray, max_pts: int) -> np.ndarray:
-        if len(pts) <= max_pts:
-            return pts
-        idx = np.random.default_rng(42).choice(len(pts), max_pts, replace=False)
-        return pts[idx]
-
-    @staticmethod
-    def _subsample_points_colors(
-        pts: np.ndarray, cols: np.ndarray, max_pts: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if len(pts) <= max_pts:
-            return pts, cols
-        idx = np.random.default_rng(42).choice(len(pts), max_pts, replace=False)
-        return pts[idx], cols[idx]
-
-    @staticmethod
-    def _stack_nonempty(*arrays: np.ndarray) -> np.ndarray:
-        nonempty = [a for a in arrays if a is not None and len(a) > 0]
-        if not nonempty:
-            return np.zeros((0, 3), dtype=np.float32)
-        return np.vstack(nonempty)
-
-    @staticmethod
-    def _centroid(pts: np.ndarray) -> np.ndarray:
-        if len(pts) == 0:
-            return np.zeros(3, dtype=np.float64)
-        return np.median(pts.astype(np.float64), axis=0)
-
-    @staticmethod
-    def _diag(pts: np.ndarray) -> float:
-        if len(pts) == 0:
-            return 0.08
-        return float(np.linalg.norm(np.ptp(pts.astype(np.float64), axis=0)))
-
-    @staticmethod
-    def _bgr_from_rgb(color_rgb) -> tuple[int, int, int]:
-        return tuple(int(v) for v in (np.asarray(color_rgb)[::-1] * 255))
-
-    def _prepare_scene_context(
-        self, pts: np.ndarray, cols: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if len(pts) == 0:
-            return pts, cols
-        dist = np.linalg.norm(pts - self.object_center.reshape(1, 3), axis=1)
-        radius = max(0.10, min(0.30, self.object_diag * 5.0))
-        keep = dist <= radius
-        if int(np.count_nonzero(keep)) < 4000:
-            keep = dist <= min(0.38, radius * 1.8)
-        if int(np.count_nonzero(keep)) > 0:
-            pts = pts[keep]
-            cols = cols[keep]
-
-        gray = np.mean(cols, axis=1, keepdims=True)
-        cols = np.clip(gray * 0.60 + cols * 0.40, 0.0, 1.0)
-        cols = np.clip(cols * 0.40 + 0.08, 0.0, 1.0)
-        return pts, cols
-
-    def _on_mode_change(self, _=None):
-        val = self.mode_var.get()
-        if val == "After Scene":
-            self.show_mode = 0
-        elif val == "Object Overlap":
-            self.show_mode = 1
-        else:
-            self.show_mode = 2
-        self._render()
-
-    def _on_press(self, event):
-        self.drag_last = (event.x, event.y)
-
-    def _on_drag(self, event):
-        if self.drag_last is None:
-            return
-        dx = event.x - self.drag_last[0]
-        dy = event.y - self.drag_last[1]
-        self.yaw += dx * 0.4
-        self.pitch += dy * 0.4
-        self.pitch = max(-89.0, min(89.0, self.pitch))
-        self.drag_last = (event.x, event.y)
-        self._render()
-
-    def _on_release(self, _):
-        self.drag_last = None
-
-    def _on_wheel(self, event):
-        delta = 0.0
-        if hasattr(event, "delta") and event.delta:
-            delta = event.delta / 120.0
-        elif event.num == 4:
-            delta = 1.0
-        elif event.num == 5:
-            delta = -1.0
-        self.zoom *= 1.1 ** delta
-        self.zoom = max(0.1, min(20.0, self.zoom))
-        self._render()
-
-    def _mode_payload(self):
-        if self.show_mode == 0:
-            focus = self._stack_nonempty(self.after_scene_pts, self.after_pts, self.aligned_pts)
-            legend = [
-                ("scene rgb", (145, 145, 145)),
-                ("after object", self._bgr_from_rgb(self.AFTER_RGB)),
-                ("aligned before", self._bgr_from_rgb(self.BEFORE_RGB)),
-            ]
-            title = "After scene reference"
-            hint = "Dim RGB scene in back, orange target object, cyan aligned result."
-            return focus, self.object_center, title, hint, legend
-        if self.show_mode == 1:
-            focus = self._stack_nonempty(self.after_pts, self.aligned_pts)
-            legend = [
-                ("after object", self._bgr_from_rgb(self.AFTER_RGB)),
-                ("aligned before", self._bgr_from_rgb(self.BEFORE_RGB)),
-            ]
-            title = "Object overlap"
-            hint = "Object-only view for checking shape overlap."
-            return focus, self.object_center, title, hint, legend
-        focus = self._stack_nonempty(self.after_scene_pts, self.before_pts, self.after_pts, self.aligned_pts)
-        legend = [
-            ("scene rgb", (145, 145, 145)),
-            ("before raw", self._bgr_from_rgb(self.BEFORE_ORIG_RGB)),
-            ("aligned before", self._bgr_from_rgb(self.BEFORE_RGB)),
-            ("after object", self._bgr_from_rgb(self.AFTER_RGB)),
-        ]
-        title = "Motion compare"
-        hint = "Green to cyan line shows how the before object moved."
-        motion_target = self._centroid(self._stack_nonempty(self.before_pts, self.after_pts, self.aligned_pts))
-        return focus, motion_target, title, hint, legend
-
-    def _draw_cloud(self, img, pts, target, view_rot, scale, color_rgb, radius=1):
-        if len(pts) == 0:
-            return
-        centered = pts.astype(np.float64) - target.reshape(1, 3)
-        view = centered @ view_rot.T
-        sx, sy, depth = view[:, 0], -view[:, 2], view[:, 1]
-        cw, ch = img.shape[1], img.shape[0]
-        xp = np.rint(cw * 0.5 + sx * scale).astype(np.int32)
-        yp = np.rint(ch * 0.5 + sy * scale).astype(np.int32)
-        valid = (xp >= 0) & (xp < cw) & (yp >= 0) & (yp < ch)
-        xp, yp, depth = xp[valid], yp[valid], depth[valid]
-        order = np.argsort(depth)
-        xp, yp = xp[order], yp[order]
-        color_bgr = tuple(int(v) for v in (np.asarray(color_rgb)[::-1] * 255))
-        if radius <= 1:
-            img[yp, xp] = np.array(color_bgr, dtype=np.uint8)
-        else:
-            for i in range(len(xp)):
-                cv2.circle(img, (int(xp[i]), int(yp[i])), radius, color_bgr, -1, cv2.LINE_AA)
-
-    def _draw_cloud_rgb(self, img, pts, cols_rgb, target, view_rot, scale, radius=1):
-        if len(pts) == 0:
-            return
-        centered = pts.astype(np.float64) - target.reshape(1, 3)
-        view = centered @ view_rot.T
-        sx, sy, depth = view[:, 0], -view[:, 2], view[:, 1]
-        cw, ch = img.shape[1], img.shape[0]
-        xp = np.rint(cw * 0.5 + sx * scale).astype(np.int32)
-        yp = np.rint(ch * 0.5 + sy * scale).astype(np.int32)
-        valid = (xp >= 0) & (xp < cw) & (yp >= 0) & (yp < ch)
-        xp, yp, depth = xp[valid], yp[valid], depth[valid]
-        cols = np.clip(cols_rgb[valid][:, ::-1] * 255, 0, 255).astype(np.uint8)
-        order = np.argsort(depth)
-        xp, yp, cols = xp[order], yp[order], cols[order]
-        if radius <= 1:
-            img[yp, xp] = cols
-        else:
-            for i in range(len(xp)):
-                cv2.circle(img, (int(xp[i]), int(yp[i])), radius,
-                           tuple(int(v) for v in cols[i]), -1, cv2.LINE_AA)
-
-    def _project_point(self, pt, target, view_rot, scale, cw, ch):
-        view = (pt.astype(np.float64) - target.astype(np.float64)) @ view_rot.T
-        return (
-            int(round(cw * 0.5 + view[0] * scale)),
-            int(round(ch * 0.5 - view[2] * scale)),
-        )
-
-    def _draw_segment(self, img, p0, p1, target, view_rot, scale, color_bgr):
-        cw, ch = img.shape[1], img.shape[0]
-        x0, y0 = self._project_point(p0, target, view_rot, scale, cw, ch)
-        x1, y1 = self._project_point(p1, target, view_rot, scale, cw, ch)
-        cv2.line(img, (x0, y0), (x1, y1), color_bgr, 2, cv2.LINE_AA)
-
-    def _draw_legend(self, img, title, hint, legend):
-        panel_w = min(img.shape[1] - 24, 500)
-        panel_h = 78 + 22 * len(legend)
-        overlay = img.copy()
-        cv2.rectangle(overlay, (12, 12), (12 + panel_w, 12 + panel_h), (18, 28, 38), -1)
-        cv2.rectangle(overlay, (12, 12), (12 + panel_w, 12 + panel_h), (60, 82, 104), 1)
-        cv2.addWeighted(overlay, 0.88, img, 0.12, 0.0, img)
-
-        cv2.putText(img, title, (24, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (238, 238, 238), 2, cv2.LINE_AA)
-        cv2.putText(img, hint, (24, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (188, 188, 188), 1, cv2.LINE_AA)
-        y = 88
-        for text, color_bgr in legend:
-            cv2.rectangle(img, (24, y - 11), (42, y + 5), color_bgr, -1)
-            cv2.putText(img, text, (54, y + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (225, 225, 225), 1, cv2.LINE_AA)
-            y += 24
-
-    def _render(self):
-        cw = max(64, self.canvas.winfo_width())
-        ch = max(64, self.canvas.winfo_height())
-
-        import math as _math
-        base_rot = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64)
-        yaw_r = _math.radians(self.yaw)
-        pitch_r = _math.radians(self.pitch)
-        rz = np.array([
-            [_math.cos(yaw_r), -_math.sin(yaw_r), 0],
-            [_math.sin(yaw_r), _math.cos(yaw_r), 0],
-            [0, 0, 1],
-        ], dtype=np.float64)
-        rx = np.array([
-            [1, 0, 0],
-            [0, _math.cos(pitch_r), -_math.sin(pitch_r)],
-            [0, _math.sin(pitch_r), _math.cos(pitch_r)],
-        ], dtype=np.float64)
-        view_rot = (rx @ rz) @ base_rot
-
-        focus_pts, target, title, hint, legend = self._mode_payload()
-        if len(focus_pts) == 0:
-            return
-
-        centered = focus_pts.astype(np.float64) - target.reshape(1, 3)
-        focus_view = centered @ view_rot.T
-        px, py = focus_view[:, 0], -focus_view[:, 2]
-        span_x = max(float(np.ptp(px)), 1e-3)
-        span_y = max(float(np.ptp(py)), 1e-3)
-        fit_scale = 0.72 * min((cw - 64) / span_x, (ch - 84) / span_y)
-        scale = max(1e-3, fit_scale * self.zoom)
-
-        img = np.zeros((ch, cw, 3), dtype=np.uint8)
-        img[:] = self.BG_RGB
-
-        if self.show_mode in (0, 2):
-            self._draw_cloud_rgb(img, self.after_scene_pts, self.after_scene_cols, target, view_rot, scale, radius=1)
-
-        if self.show_mode == 0:
-            self._draw_cloud(img, self.after_pts, target, view_rot, scale, self.AFTER_RGB, radius=5)
-            self._draw_cloud(img, self.aligned_pts, target, view_rot, scale, self.BEFORE_RGB, radius=5)
-        elif self.show_mode == 1:
-            self._draw_cloud(img, self.after_pts, target, view_rot, scale, self.AFTER_RGB, radius=5)
-            self._draw_cloud(img, self.aligned_pts, target, view_rot, scale, self.BEFORE_RGB, radius=5)
-        else:
-            self._draw_cloud(img, self.before_pts, target, view_rot, scale, self.BEFORE_ORIG_RGB, radius=4)
-            self._draw_cloud(img, self.after_pts, target, view_rot, scale, self.AFTER_RGB, radius=5)
-            self._draw_cloud(img, self.aligned_pts, target, view_rot, scale, self.BEFORE_RGB, radius=5)
-            self._draw_segment(img, self.before_center, self.aligned_center, target, view_rot, scale, self.TRAIL_RGB)
-
-        self._draw_legend(img, title, hint, legend)
-
-        bottom_lines = self.info_text.split("\n")[:8]
-        for i, line in enumerate(bottom_lines):
-            cv2.putText(
-                img, line, (12, ch - 12 - (len(bottom_lines) - 1 - i) * 18),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA,
-            )
-
-        from PIL import Image as PILImage
-        pil_img = PILImage.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        self.photo = self._ImageTk.PhotoImage(pil_img)
-        if self.image_id is None:
-            self.image_id = self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
-        else:
-            self.canvas.itemconfig(self.image_id, image=self.photo)
-
-    def run(self):
-        self._render()
-        if self._standalone:
-            self.root.mainloop()
-
-
-def run_local(
-    before_left_path: str, before_right_path: str,
-    after_left_path: str, after_right_path: str,
-    intrinsic_path: str,
-    object_name: str = "",
-    sam3_url: str = DEFAULT_SAM3_URL,
-    s2m2_url: str = DEFAULT_S2M2_URL,
-    voxel_size: float = 0.003,
-    use_coarse_fine: bool = True,
-    enable_pcd_fit: bool = True,
-    enable_lightglue_init: bool = True,
-    enable_tapir_init: bool = True,
-    init_candidate_mode: str = "auto",
-    tapir_cfg: TapirMatchConfig | None = None,
-    save_dir: str | None = None,
-    parent=None,
-    show_viewer: bool = True,
-    log_fn=None,
-):
-    """Run the full pipeline locally with tkinter viewer (same style as pointcloud_viewer.py)."""
-    _log_fn = log_fn or (lambda msg: print(msg))
-    local_total_start = time.perf_counter()
-    outer_timings: Dict[str, float] = {}
-    ret: Dict[str, Any] = {
-        "success": False,
-        "result": None,
-        "info_lines": [],
-        "before_mask_vis": None,
-        "after_mask_vis": None,
-        "reg2d_vis": None,
-        "before_shape_vis": None,
-        "after_shape_vis": None,
-        "lightglue_match_vis": None,
-        "tapir_match_vis": None,
-        "before_det_debug": None,
-        "after_det_debug": None,
-        "detection_summary": "",
-        "metric_summary": "",
-        "lightglue_summary": "",
-        "shape_summary": "",
-        "save_dir": None,
-        "pcds": None,
-        "scene_after": None,
-        "overlay_image_path": None,
-        "bundle_path": None,
-        "error": None,
-        "error_traceback": None,
-        "pcd_fit_enabled": bool(enable_pcd_fit),
-        "lightglue_init_enabled": bool(enable_lightglue_init),
-        "tapir_init_enabled": bool(enable_tapir_init),
-        "init_candidate_mode": str(init_candidate_mode or "auto"),
-    }
-
-    _log_fn("=" * 60)
-    _log_fn("  Post-Grasp In-Hand Pose Re-Estimation (Local Mode)")
-    _log_fn("=" * 60)
-
-    t_stage = time.perf_counter()
-    before_left = cv2.cvtColor(cv2.imread(before_left_path), cv2.COLOR_BGR2RGB)
-    before_right = cv2.cvtColor(cv2.imread(before_right_path), cv2.COLOR_BGR2RGB)
-    after_left = cv2.cvtColor(cv2.imread(after_left_path), cv2.COLOR_BGR2RGB)
-    after_right = cv2.cvtColor(cv2.imread(after_right_path), cv2.COLOR_BGR2RGB)
-    outer_timings["input / load images"] = time.perf_counter() - t_stage
-    _log_fn(f"  Images: before={before_left.shape}, after={after_left.shape}")
-
-    t_stage = time.perf_counter()
-    intr = _parse_intrinsic_file(intrinsic_path)
-    fx, fy, cx, cy, baseline = intr["fx"], intr["fy"], intr["cx"], intr["cy"], intr["baseline"]
-    h, w = before_left.shape[:2]
-    K = CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, width=w, height=h)
-    outer_timings["input / parse intrinsics"] = time.perf_counter() - t_stage
-    _log_fn(f"  Intrinsics: fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f} baseline={baseline:.4f}m")
-
-    _log_fn("\n[1/4] S2M2 depth estimation...")
-    t0 = time.perf_counter()
-    before_depth = depth_to_meters(call_s2m2_depth(before_left, before_right, fx, fy, cx, cy, baseline, s2m2_url), target_hw=(h, w))
-    _log_fn(f"  Before: valid={int((before_depth > 0).sum())}, {int((time.perf_counter()-t0)*1000)}ms")
-    outer_timings["service / S2M2 before"] = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    ah, aw = after_left.shape[:2]
-    after_depth = depth_to_meters(call_s2m2_depth(after_left, after_right, fx, fy, cx, cy, baseline, s2m2_url), target_hw=(ah, aw))
-    _log_fn(f"  After:  valid={int((after_depth > 0).sum())}, {int((time.perf_counter()-t0)*1000)}ms")
-    outer_timings["service / S2M2 after"] = time.perf_counter() - t0
-
-    _log_fn("\n[2/4] Qwen detection + SAM3 segmentation...")
-    obj_prompt = object_name.strip() or None
-    t0 = time.perf_counter()
-    before_mask, before_bbox, before_det_debug = detect_and_segment(before_left, text_prompt=obj_prompt, sam3_url=sam3_url)
-    _log_fn(f"  Before mask: {int((before_mask > 0).sum())}px, bbox={before_bbox}, {int((time.perf_counter()-t0)*1000)}ms")
-    outer_timings["service / detect+segment before"] = time.perf_counter() - t0
-    t0 = time.perf_counter()
-    after_mask, after_bbox, after_det_debug = detect_and_segment(after_left, text_prompt=obj_prompt, sam3_url=sam3_url)
-    _log_fn(f"  After mask:  {int((after_mask > 0).sum())}px, bbox={after_bbox}, {int((time.perf_counter()-t0)*1000)}ms")
-    outer_timings["service / detect+segment after"] = time.perf_counter() - t0
-    before_overlap = int(((before_mask > 0) & (before_depth > 0)).sum())
-    after_overlap = int(((after_mask > 0) & (after_depth > 0)).sum())
-    _log_fn(f"  Before mask∩depth: {before_overlap}")
-    _log_fn(f"  After  mask∩depth: {after_overlap}")
-
-    before_mask_vis = _draw_detection_overlay(
-        before_left, before_mask, before_bbox,
-        color=(0, 180, 0), box_color=(0, 255, 0),
-        label=before_det_debug.get("source", ""),
-    )
-    after_mask_vis = _draw_detection_overlay(
-        after_left, after_mask, after_bbox,
-        color=(0, 140, 190), box_color=(0, 128, 255),
-        label=after_det_debug.get("source", ""),
-    )
-    ret["before_mask_vis"] = before_mask_vis
-    ret["after_mask_vis"] = after_mask_vis
-    ret["before_det_debug"] = before_det_debug
-    ret["after_det_debug"] = after_det_debug
-    ret["detection_summary"] = "\n\n".join([
-        _build_detection_debug_text("Before", before_det_debug, before_bbox, before_mask, before_depth),
-        _build_detection_debug_text("After", after_det_debug, after_bbox, after_mask, after_depth),
-    ])
-
-    if before_overlap < 80 or after_overlap < 80:
-        _log_fn("  Warning: mask∩depth 很小，Qwen/SAM3 结果可能不稳定，下面会尝试宽松点云过滤重试。")
-
-    _log_fn("\n[3/4] Point cloud registration...")
-    cfg = RegistrationConfig(voxel_size=voxel_size)
-    cfg_used = cfg
-    t_stage = time.perf_counter()
-    try:
-            result = run_reestimation(
-                before_rgb=before_left, before_depth=before_depth, before_mask=before_mask,
-                after_rgb=after_left, after_depth=after_depth, after_mask=after_mask,
-                K_wrist=K, use_coarse_fine=use_coarse_fine, enable_pcd_fit=enable_pcd_fit,
-                enable_lightglue_init=enable_lightglue_init,
-                enable_tapir_init=enable_tapir_init,
-                init_candidate_mode=init_candidate_mode,
-                tapir_cfg=tapir_cfg,
-                cfg=cfg_used,
-            )
-    except Exception as first_err:
-        err_msg = str(first_err)
-        if (
-            "No valid object points after mask/depth filtering" in err_msg
-            or "Point cloud became empty" in err_msg
-        ):
-            cfg_used = replace(
-                cfg,
-                erode_kernel=1,
-                erode_iters=0,
-                remove_depth_edge_points=False,
-                iqr_multiplier=0.0,
-                outlier_nb_neighbors=8,
-                outlier_std_ratio=2.5,
-                radius_outlier_radius=0.0,
-                radius_outlier_min_neighbors=0,
-                min_visible_points=20,
-            )
-            _log_fn("  初次点云构建失败，使用宽松过滤参数重试...")
-            try:
-                result = run_reestimation(
-                    before_rgb=before_left, before_depth=before_depth, before_mask=before_mask,
-                    after_rgb=after_left, after_depth=after_depth, after_mask=after_mask,
-                    K_wrist=K, use_coarse_fine=use_coarse_fine, enable_pcd_fit=enable_pcd_fit,
-                    enable_lightglue_init=enable_lightglue_init,
-                    enable_tapir_init=enable_tapir_init,
-                    init_candidate_mode=init_candidate_mode,
-                    tapir_cfg=tapir_cfg,
-                    cfg=cfg_used,
-                )
-            except Exception as retry_err:
-                ret["error"] = str(retry_err)
-                ret["error_traceback"] = traceback.format_exc()
-                _log_fn(f"\n{'='*50}\n失败: {ret['error']}\n{ret['error_traceback']}")
-                return ret
-        else:
-            ret["error"] = err_msg
-            ret["error_traceback"] = traceback.format_exc()
-            _log_fn(f"\n{'='*50}\n失败: {err_msg}\n{ret['error_traceback']}")
-            return ret
-    outer_timings["pipeline / run_reestimation"] = time.perf_counter() - t_stage
-    ret["pcd_fit_enabled"] = bool(result.debug.get("pcd_fit_enabled", enable_pcd_fit))
-    ret["lightglue_init_enabled"] = bool(result.debug.get("lightglue_init_enabled", enable_lightglue_init))
-    ret["tapir_init_enabled"] = bool(result.debug.get("tapir_init_enabled", enable_tapir_init))
-    for name, seconds in (result.debug.get("focus_stage_timings_s") or {}).items():
-        outer_timings[f"core / {name}"] = float(seconds)
-
-    q = result.debug.get("quality", {})
-    t_vec = result.T_slip[:3, 3]
-    frame_name = result.debug.get("t_slip_frame", "camera")
-    key_metric_lines = _build_key_metric_lines(result)
-    ret["metric_summary"] = "\n".join(key_metric_lines)
-    info_lines = key_metric_lines + [
-        "",
-        "Details:",
-        f"Quality: {q.get('quality', '?').upper()} | Mode: {result.mode} | {result.elapsed_s:.2f}s",
-        f"Init: {result.debug.get('best_init', '?')}",
-        f"GICP fitness: {result.debug.get('reg_gicp_fitness', '?')} | RMSE: {result.debug.get('reg_gicp_inlier_rmse', '?')}",
-        f"T_slip trans: [{t_vec[0]:.4f}, {t_vec[1]:.4f}, {t_vec[2]:.4f}]m ({np.linalg.norm(t_vec):.4f}m)",
-    ]
-    if result.debug.get("reg_axis_prior_weight", 0.0) > 1e-6:
-        info_lines.append(
-            "Elongated prior:"
-            f" w={result.debug.get('reg_axis_prior_weight', 0.0):.3f}"
-            f" axis={result.debug.get('reg_axis_alignment_score', 0.0):.3f}"
-            f" center={result.debug.get('reg_axis_center_score', 0.0):.3f}"
-        )
-    if result.debug.get("reg_silhouette_f1") is not None:
-        info_lines.append(
-            "Proj mask overlap:"
-            f" F1={result.debug.get('reg_silhouette_f1', 0.0):.3f}"
-            f" IoU={result.debug.get('reg_silhouette_iou', 0.0):.3f}"
-            f" P={result.debug.get('reg_silhouette_precision', 0.0):.3f}"
-            f" R={result.debug.get('reg_silhouette_recall', 0.0):.3f}"
-        )
-    if result.debug.get("reg_cloud_overlap_enabled"):
-        info_lines.append(
-            "Cloud overlap:"
-            f" F1={result.debug.get('reg_cloud_overlap_f1', 0.0):.3f}"
-            f" P={result.debug.get('reg_cloud_overlap_precision', 0.0):.3f}"
-            f" R={result.debug.get('reg_cloud_overlap_recall', 0.0):.3f}"
-            f" chamfer={1000.0 * result.debug.get('reg_cloud_overlap_chamfer_m', 0.0):.1f}mm"
-        )
-    if result.debug.get("reg_shape_weight", 0.0) > 1e-6:
-        info_lines.append(
-            "Shape prior:"
-            f" w={result.debug.get('reg_shape_weight', 0.0):.3f}"
-            f" score={result.debug.get('reg_shape_score', 0.0):.3f}"
-            f" center={result.debug.get('reg_shape_center_score', 0.0):.3f}"
-            f" axis={result.debug.get('reg_shape_axis_score', 0.0):.3f}"
-        )
-    shape_pair_info = result.debug.get("shape_prior_pair") or {}
-    if shape_pair_info.get("selected"):
-        info_lines.append(
-            "Shape pair:"
-            f" src={shape_pair_info.get('source_type')}"
-            f" tgt={shape_pair_info.get('target_type')}"
-            f" mode={shape_pair_info.get('selection_mode')}"
-            f" compat={shape_pair_info.get('compatibility', 0.0):.3f}"
-            f" conf={shape_pair_info.get('confidence', 0.0):.3f}"
-        )
-        if (
-            shape_pair_info.get("source_type") != shape_pair_info.get("source_best_type")
-            or shape_pair_info.get("target_type") != shape_pair_info.get("target_best_type")
-        ):
-            info_lines.append(
-                "Shape pair fallback:"
-                f" best=({shape_pair_info.get('source_best_type')}->{shape_pair_info.get('target_best_type')})"
-                f" selected=({shape_pair_info.get('source_type')}->{shape_pair_info.get('target_type')})"
-            )
-    relation_info = result.debug.get("shape_relation_info") or {}
-    if relation_info.get("available"):
-        info_lines.append(
-            "M3 endpoint cue:"
-            f" pref={relation_info.get('preferred_relation')}"
-            f" conf={relation_info.get('confidence', 0.0):.3f}"
-            f" same={relation_info.get('same_score', 0.0):.3f}"
-            f" reversed={relation_info.get('reversed_score', 0.0):.3f}"
-        )
-    if result.debug.get("reg_m3_flip_applied"):
-        info_lines.append("M3 flip correction: applied")
-    if result.debug.get("reg_shape_snap_applied"):
-        info_lines.append(f"Shape center snap: {result.debug.get('reg_shape_snap_applied')}")
-    if result.debug.get("reg_micro_refine_applied"):
-        info_lines.append(f"Metric micro-refine: {result.debug.get('reg_micro_refine_applied')}")
-    if cfg_used is not cfg:
-        info_lines.append("Point-cloud filtering: relaxed retry was used")
-    if not result.debug.get("pcd_fit_enabled", True):
-        info_lines.append("PCD-fit: disabled")
-    lightglue_info = result.debug.get("lightglue_init") or {}
-    if lightglue_info.get("enabled"):
-        info_lines.append(
-            "SuperPoint-LightGlue:"
-            f" success={bool(lightglue_info.get('success'))}"
-            f" scope={lightglue_info.get('match_scope', '-')}"
-            f" matches={lightglue_info.get('num_matches', 0)}"
-            f" mask={lightglue_info.get('num_mask_matches', 0)}"
-            f" roi={lightglue_info.get('num_roi_matches', 0)}"
-            f" near={lightglue_info.get('num_roi_near_mask_matches', 0)}"
-            f" valid3d={lightglue_info.get('num_valid_3d_matches', 0)}"
-            f" inliers={lightglue_info.get('num_inliers', 0)}"
-            f" nearIn={lightglue_info.get('num_near_mask_inliers', 0)}"
-            f" ratio={lightglue_info.get('inlier_ratio', 0.0):.3f}"
-            f" nearRatio={lightglue_info.get('near_mask_inlier_ratio', 0.0):.3f}"
-            f" rmse={1000.0 * float(lightglue_info.get('ransac_rmse_m', 0.0) or 0.0):.1f}mm"
-            f" mode={lightglue_info.get('acceptance_mode', '-')}"
-            f" smallFallback={bool(lightglue_info.get('small_sample_fallback_used'))}"
-            f" candidate_added={bool(lightglue_info.get('candidate_added'))}"
-        )
-        if lightglue_info.get("error") or lightglue_info.get("reason"):
-            info_lines.append(f"LightGlue init note: {lightglue_info.get('error') or lightglue_info.get('reason')}")
-    info_lines.extend(_t_slip_rotation_lines(result.T_slip, frame_name, compact=True))
-    info_lines.append("")
-    info_lines.extend(_build_timing_lines("Outer pipeline timings:", outer_timings))
-    info_lines.extend(_build_timing_lines("Re-estimation timings:", result.debug.get("stage_timings_s")))
-    info_lines.extend(_build_timing_lines("Winner registration timings:", result.debug.get("winner_stage_timings_s")))
-
-    shape_summary_lines: list[str] = []
-    if not result.debug.get("pcd_fit_enabled", True):
-        shape_summary_lines.append("本次已关闭 PCD-fit，已跳过 primitive fit / shape prior。")
-    shape_pair_info = result.debug.get("shape_prior_pair") or {}
-    if shape_pair_info.get("selected"):
-        shape_summary_lines.append(
-            "Prior pair:"
-            f" src={shape_pair_info.get('source_type')}"
-            f" tgt={shape_pair_info.get('target_type')}"
-            f" mode={shape_pair_info.get('selection_mode')}"
-            f" compat={shape_pair_info.get('compatibility', 0.0):.3f}"
-            f" conf={shape_pair_info.get('confidence', 0.0):.3f}"
-        )
-        if (
-            shape_pair_info.get("source_type") != shape_pair_info.get("source_best_type")
-            or shape_pair_info.get("target_type") != shape_pair_info.get("target_best_type")
-        ):
-            shape_summary_lines.append(
-                "Prior pair fallback:"
-                f" best=({shape_pair_info.get('source_best_type')}->{shape_pair_info.get('target_best_type')})"
-                f" selected=({shape_pair_info.get('source_type')}->{shape_pair_info.get('target_type')})"
-            )
-        shape_summary_lines.append("")
-    if result.debug.get("shape_before_fit"):
-        shape_summary_lines.extend(summarize_fit_result_lines(result.debug.get("shape_before_fit"), prefix="Before"))
-    if result.debug.get("shape_after_fit"):
-        if shape_summary_lines:
-            shape_summary_lines.append("")
-        shape_summary_lines.extend(summarize_fit_result_lines(result.debug.get("shape_after_fit"), prefix="After"))
-    if result.debug.get("shape_before_fit_error"):
-        shape_summary_lines.append(f"Before fit error: {result.debug.get('shape_before_fit_error')}")
-    if result.debug.get("shape_after_fit_error"):
-        shape_summary_lines.append(f"After fit error: {result.debug.get('shape_after_fit_error')}")
-    ret["shape_summary"] = "\n".join(shape_summary_lines)
-    if lightglue_info.get("enabled"):
-        ret["lightglue_summary"] = "\n".join([
-            f"SuperPoint-LightGlue success: {bool(lightglue_info.get('success'))}",
-            f"match scope: {lightglue_info.get('match_scope', '-')}",
-            f"raw matches: {lightglue_info.get('num_matches', 0)}",
-            f"mask matches: {lightglue_info.get('num_mask_matches', 0)}",
-            f"expanded ROI matches: {lightglue_info.get('num_roi_matches', 0)}",
-            f"near-mask ROI matches: {lightglue_info.get('num_roi_near_mask_matches', 0)}",
-            f"region+depth matches before cap: {lightglue_info.get('num_region_depth_matches', 0)}",
-            f"valid 3D matches: {lightglue_info.get('num_valid_3d_matches', 0)}",
-            f"valid mask 3D matches: {lightglue_info.get('num_valid_mask_3d_matches', 0)}",
-            f"valid near-mask 3D matches: {lightglue_info.get('num_valid_near_mask_3d_matches', 0)}",
-            f"valid ROI-only 3D matches: {lightglue_info.get('num_valid_roi_only_3d_matches', 0)}",
-            f"valid far-ROI 3D matches: {lightglue_info.get('num_valid_far_roi_3d_matches', 0)}",
-            f"RANSAC inliers: {lightglue_info.get('num_inliers', 0)}",
-            f"mask inliers: {lightglue_info.get('num_mask_inliers', 0)}",
-            f"near-mask inliers: {lightglue_info.get('num_near_mask_inliers', 0)}",
-            f"ROI-only inliers: {lightglue_info.get('num_roi_only_inliers', 0)}",
-            f"far-ROI inliers: {lightglue_info.get('num_far_roi_inliers', 0)}",
-            f"inlier ratio: {lightglue_info.get('inlier_ratio', 0.0):.3f}",
-            f"near-mask inlier ratio: {lightglue_info.get('near_mask_inlier_ratio', 0.0):.3f}",
-            f"object projection near-mask ratio: {lightglue_info.get('object_projection_near_mask_ratio', 0.0):.3f}",
-            f"object projection gate ok: {bool(lightglue_info.get('object_projection_gate_ok'))}",
-            f"RANSAC RMSE: {1000.0 * float(lightglue_info.get('ransac_rmse_m', 0.0) or 0.0):.2f} mm",
-            f"small-sample fallback used: {bool(lightglue_info.get('small_sample_fallback_used'))}",
-            f"required min inliers: {lightglue_info.get('required_min_inliers', '-')}",
-            f"required min ratio: {lightglue_info.get('required_min_inlier_ratio', '-')}",
-            f"required max RMSE: {1000.0 * float(lightglue_info.get('required_max_ransac_rmse_m', 0.0) or 0.0):.2f} mm",
-            f"required near-mask ratio: {lightglue_info.get('required_min_near_mask_inlier_ratio', '-')}",
-            f"required object projection near-mask ratio: {lightglue_info.get('required_min_object_projection_near_mask_ratio', '-')}",
-            f"near-mask gate ok: {bool(lightglue_info.get('near_mask_gate_ok'))}",
-            f"acceptance mode: {lightglue_info.get('acceptance_mode', '-')}",
-            f"candidate added: {bool(lightglue_info.get('candidate_added'))}",
-            f"best init: {result.debug.get('best_init', '?')}",
-        ])
-        timing_rows = lightglue_info.get("timings_s") or {}
-        if timing_rows:
-            ret["lightglue_summary"] += "\n" + "\n".join(_build_timing_lines("LightGlue timings:", timing_rows))
-
-    for line in info_lines:
-        _log_fn(f"  {line}")
-    _log_fn(f"\n  T_registration:\n{np.array2string(result.T_registration, precision=6, suppress_small=True)}")
-
-    _log_fn("\n[4/4] Building point clouds...")
-    t_stage = time.perf_counter()
-    try:
-        bp = rgbd_to_pointcloud(before_left, before_depth, before_mask, K, cfg_used)
-        bp = preprocess_pcd(bp, cfg_used)
-        ap = rgbd_to_pointcloud(after_left, after_depth, after_mask, K, cfg_used)
-        ap = preprocess_pcd(ap, cfg_used)
-        aligned = copy_pcd(bp)
-        aligned.transform(result.T_registration)
-        after_scene_pcd = _build_context_scene_pcd(
-            after_left, after_depth, after_mask, K,
-            voxel_size=max(voxel_size * 1.5, 0.006),
-        )
-        reg2d_vis = _draw_registration_overlay_2d(
-            after_left, after_mask, after_depth, K,
-            after_pcd=ap, aligned_pcd=aligned,
-        )
-
-        before_shape_raw = result.debug.get("_shape_before_fit_raw")
-        after_shape_raw = result.debug.get("_shape_after_fit_raw")
-        K_mat = np.array([
-            [K.fx, 0.0, K.cx],
-            [0.0, K.fy, K.cy],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-        if before_shape_raw:
-            before_shape_vis = render_best_fit_overlay_image(
-                image_bgr=cv2.cvtColor(before_left, cv2.COLOR_RGB2BGR),
-                object_points_cam=np.asarray(bp.points, dtype=np.float64),
-                fit_result=before_shape_raw,
-                K=K_mat,
-            )
-            ret["before_shape_vis"] = cv2.cvtColor(before_shape_vis, cv2.COLOR_BGR2RGB)
-        if after_shape_raw:
-            after_shape_vis = render_best_fit_overlay_image(
-                image_bgr=cv2.cvtColor(after_left, cv2.COLOR_RGB2BGR),
-                object_points_cam=np.asarray(ap.points, dtype=np.float64),
-                fit_result=after_shape_raw,
-                K=K_mat,
-            )
-            ret["after_shape_vis"] = cv2.cvtColor(after_shape_vis, cv2.COLOR_BGR2RGB)
-        lightglue_raw = result.debug.get("_lightglue_init_raw")
-        if lightglue_raw is not None:
-            ret["lightglue_match_vis"] = draw_lightglue_matches(before_left, after_left, lightglue_raw)
-        tapir_raw = result.debug.get("_tapir_init_raw")
-        if tapir_raw is not None:
-            ret["tapir_match_vis"] = draw_tapir_matches(before_left, after_left, tapir_raw)
-    except Exception as build_err:
-        ret["result"] = result
-        ret["info_lines"] = info_lines
-        ret["error"] = str(build_err)
-        ret["error_traceback"] = traceback.format_exc()
-        _log_fn(f"\n{'='*50}\n失败: {build_err}\n{ret['error_traceback']}")
-        return ret
-    outer_timings["visual / build pointcloud outputs"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    if save_dir is None:
-        save_dir = tempfile.mkdtemp(prefix="pose_inhand_local_")
-    os.makedirs(save_dir, exist_ok=True)
-    o3d.io.write_point_cloud(os.path.join(save_dir, "object_before.ply"), bp)
-    o3d.io.write_point_cloud(os.path.join(save_dir, "object_after.ply"), ap)
-    o3d.io.write_point_cloud(os.path.join(save_dir, "object_before_aligned.ply"), aligned)
-    overlay_path = os.path.join(save_dir, "overlay_after_registration.png")
-    cv2.imwrite(overlay_path, cv2.cvtColor(reg2d_vis, cv2.COLOR_RGB2BGR))
-    before_shape_overlay_path = None
-    after_shape_overlay_path = None
-    lightglue_match_overlay_path = None
-    tapir_match_overlay_path = None
-    if ret.get("before_shape_vis") is not None:
-        before_shape_overlay_path = os.path.join(save_dir, "before_shape_overlay.png")
-        cv2.imwrite(before_shape_overlay_path, cv2.cvtColor(ret["before_shape_vis"], cv2.COLOR_RGB2BGR))
-    if ret.get("after_shape_vis") is not None:
-        after_shape_overlay_path = os.path.join(save_dir, "after_shape_overlay.png")
-        cv2.imwrite(after_shape_overlay_path, cv2.cvtColor(ret["after_shape_vis"], cv2.COLOR_RGB2BGR))
-    if ret.get("lightglue_match_vis") is not None:
-        lightglue_match_overlay_path = os.path.join(save_dir, "lightglue_matches_overlay.png")
-        cv2.imwrite(lightglue_match_overlay_path, cv2.cvtColor(ret["lightglue_match_vis"], cv2.COLOR_RGB2BGR))
-    if ret.get("tapir_match_vis") is not None:
-        tapir_match_overlay_path = os.path.join(save_dir, "tapir_matches_overlay.png")
-        cv2.imwrite(tapir_match_overlay_path, cv2.cvtColor(ret["tapir_match_vis"], cv2.COLOR_RGB2BGR))
-    if result.debug.get("shape_before_fit"):
-        with open(os.path.join(save_dir, "shape_before_fit.json"), "w") as f:
-            json.dump(result.debug.get("shape_before_fit"), f, indent=2, default=str)
-    if result.debug.get("shape_after_fit"):
-        with open(os.path.join(save_dir, "shape_after_fit.json"), "w") as f:
-            json.dump(result.debug.get("shape_after_fit"), f, indent=2, default=str)
-    if ret.get("shape_summary"):
-        with open(os.path.join(save_dir, "shape_fit_summary.txt"), "w") as f:
-            f.write(ret["shape_summary"] + "\n")
-    if ret.get("metric_summary"):
-        with open(os.path.join(save_dir, "key_metrics_summary.txt"), "w") as f:
-            f.write(ret["metric_summary"] + "\n")
-    if ret.get("lightglue_summary"):
-        with open(os.path.join(save_dir, "lightglue_match_summary.txt"), "w") as f:
-            f.write(ret["lightglue_summary"] + "\n")
-    registration_diagnostics = {
-        "initial_best_init": result.debug.get("initial_best_init"),
-        "initial_best_score": result.debug.get("initial_best_score"),
-        "best_init": result.debug.get("best_init"),
-        "best_score": result.debug.get("best_score"),
-        "init_candidate_mode": result.debug.get("init_candidate_mode"),
-        "candidate_inits": result.debug.get("candidate_inits"),
-        "init_method_buckets": result.debug.get("init_method_buckets"),
-        "pca_frame_init": result.debug.get("pca_frame_init"),
-        "shape_prior_pair": result.debug.get("shape_prior_pair"),
-        "silhouette_init": result.debug.get("silhouette_init"),
-        "init_diagnostics": result.debug.get("init_diagnostics"),
-        "shape_snap_best_candidate": result.debug.get("shape_snap_best_candidate"),
-        "shape_snap_candidate_score": result.debug.get("shape_snap_candidate_score"),
-        "shape_snap_center_delta_m": result.debug.get("shape_snap_center_delta_m"),
-        "shape_snap_diagnostics": result.debug.get("shape_snap_diagnostics"),
-        "micro_refine_gate": result.debug.get("micro_refine_gate"),
-        "micro_refine_rounds": result.debug.get("micro_refine_rounds"),
-        "micro_refine_sequence": result.debug.get("micro_refine_sequence"),
-    }
-    with open(os.path.join(save_dir, "registration_diagnostics.json"), "w") as f:
-        json.dump(registration_diagnostics, f, indent=2, default=str)
-    with open(os.path.join(save_dir, "result.json"), "w") as f:
-        json.dump({"success": result.success, "mode": result.mode,
-                    "T_slip": result.T_slip.tolist(), "T_registration": result.T_registration.tolist(),
-                    "quality": q, "elapsed_s": result.elapsed_s,
-                    "initial_best_init": result.debug.get("initial_best_init"),
-                    "initial_best_score": result.debug.get("initial_best_score"),
-                    "best_init": result.debug.get("best_init"),
-                    "best_score": result.debug.get("best_score"),
-                    "init_candidate_mode": result.debug.get("init_candidate_mode"),
-                    "candidate_inits": result.debug.get("candidate_inits"),
-                    "init_method_buckets": result.debug.get("init_method_buckets"),
-                    "pca_frame_init": result.debug.get("pca_frame_init"),
-                    "shape_init_candidates": result.debug.get("shape_init_candidates"),
-                    "silhouette_init": result.debug.get("silhouette_init"),
-                    "shape_before_confidence": result.debug.get("shape_before_confidence"),
-                    "shape_after_confidence": result.debug.get("shape_after_confidence"),
-                    "axis_prior_weight": result.debug.get("reg_axis_prior_weight"),
-                    "axis_alignment_score": result.debug.get("reg_axis_alignment_score"),
-                    "axis_center_score": result.debug.get("reg_axis_center_score"),
-                    "axis_length_score": result.debug.get("reg_axis_length_score"),
-                    "silhouette_f1": result.debug.get("reg_silhouette_f1"),
-                    "silhouette_iou": result.debug.get("reg_silhouette_iou"),
-                    "silhouette_precision": result.debug.get("reg_silhouette_precision"),
-                    "silhouette_recall": result.debug.get("reg_silhouette_recall"),
-                    "cloud_overlap_enabled": result.debug.get("reg_cloud_overlap_enabled"),
-                    "cloud_overlap_weight": result.debug.get("reg_cloud_overlap_weight"),
-                    "cloud_overlap_score": result.debug.get("reg_cloud_overlap_score"),
-                    "cloud_overlap_f1": result.debug.get("reg_cloud_overlap_f1"),
-                    "cloud_overlap_precision": result.debug.get("reg_cloud_overlap_precision"),
-                    "cloud_overlap_recall": result.debug.get("reg_cloud_overlap_recall"),
-                    "cloud_overlap_chamfer_m": result.debug.get("reg_cloud_overlap_chamfer_m"),
-                    "cloud_overlap_robust_m": result.debug.get("reg_cloud_overlap_robust_m"),
-                    "shape_weight": result.debug.get("reg_shape_weight"),
-                    "shape_score": result.debug.get("reg_shape_score"),
-                    "shape_center_score": result.debug.get("reg_shape_center_score"),
-                    "shape_axis_score": result.debug.get("reg_shape_axis_score"),
-                    "shape_size_score": result.debug.get("reg_shape_size_score"),
-                    "shape_endpoint_score": result.debug.get("reg_shape_endpoint_score"),
-                    "shape_rotation_score": result.debug.get("reg_shape_rotation_score"),
-                    "shape_relation_score": result.debug.get("reg_shape_relation_score"),
-                    "shape_prior_pair": result.debug.get("shape_prior_pair"),
-                    "shape_relation_info": result.debug.get("shape_relation_info"),
-                    "m3_flip_applied": result.debug.get("reg_m3_flip_applied"),
-                    "shape_snap_applied": result.debug.get("reg_shape_snap_applied"),
-                    "shape_snap_best_candidate": result.debug.get("shape_snap_best_candidate"),
-                    "shape_snap_candidate_score": result.debug.get("shape_snap_candidate_score"),
-                    "shape_snap_center_delta_m": result.debug.get("shape_snap_center_delta_m"),
-                    "shape_snap_diagnostics": result.debug.get("shape_snap_diagnostics"),
-                    "init_diagnostics": result.debug.get("init_diagnostics"),
-                    "micro_refine_gate": result.debug.get("micro_refine_gate"),
-                    "micro_refine_applied": result.debug.get("reg_micro_refine_applied"),
-                    "micro_refine_rounds": result.debug.get("micro_refine_rounds"),
-                    "micro_refine_sequence": result.debug.get("micro_refine_sequence"),
-                    "shape_before_fit": result.debug.get("shape_before_fit"),
-                    "shape_after_fit": result.debug.get("shape_after_fit"),
-                    "pcd_fit_enabled": result.debug.get("pcd_fit_enabled"),
-                    "lightglue_init_enabled": result.debug.get("lightglue_init_enabled"),
-                    "tapir_init_enabled": result.debug.get("tapir_init_enabled"),
-                    "lightglue_init": result.debug.get("lightglue_init"),
-                    "tapir_init": result.debug.get("tapir_init"),
-                    "pcd_fpfh_ransac": result.debug.get("pcd_fpfh_ransac"),
-                    "key_metrics_summary": ret.get("metric_summary"),
-                    "pipeline_stage_timings_s": outer_timings,
-                    "reestimation_stage_timings_s": result.debug.get("stage_timings_s"),
-                    "winner_registration_stage_timings_s": result.debug.get("winner_stage_timings_s")}, f, indent=2, default=str)
-    bundle_path = os.path.join(save_dir, "result_bundle.zip")
-    with zipfile.ZipFile(bundle_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_name in [
-            "object_before.ply",
-            "object_after.ply",
-            "object_before_aligned.ply",
-            "overlay_after_registration.png",
-            "result.json",
-            "before_shape_overlay.png",
-            "after_shape_overlay.png",
-            "shape_before_fit.json",
-            "shape_after_fit.json",
-            "shape_fit_summary.txt",
-            "key_metrics_summary.txt",
-            "lightglue_matches_overlay.png",
-            "tapir_matches_overlay.png",
-            "lightglue_match_summary.txt",
-            "registration_diagnostics.json",
-        ]:
-            file_path = os.path.join(save_dir, file_name)
-            if os.path.isfile(file_path):
-                zf.write(file_path, file_name)
-    outer_timings["export / save outputs"] = time.perf_counter() - t_stage
-    outer_timings["local pipeline / total"] = time.perf_counter() - local_total_start
-    final_outer_timing_lines = _build_timing_lines("Final outer pipeline timings:", outer_timings)
-    if final_outer_timing_lines:
-        info_lines.append("")
-        info_lines.extend(final_outer_timing_lines)
-        for line in final_outer_timing_lines:
-            _log_fn(f"  {line}")
-    _log_fn(f"  Saved to: {save_dir}")
-
-    if show_viewer:
-        _log_fn("\n  Opening viewer (drag=rotate, scroll=zoom, dropdown=switch view)...\n")
-        viewer = _LocalResultViewer(
-            bp, ap, aligned,
-            after_scene_pcd=after_scene_pcd,
-            info_text="\n".join(info_lines),
-            parent=parent,
-        )
-        viewer.run()
-
-    ret["success"] = True
-    ret["result"] = result
-    ret["info_lines"] = info_lines
-    ret["save_dir"] = save_dir
-    ret["scene_after"] = after_scene_pcd
-    ret["reg2d_vis"] = reg2d_vis
-    ret["overlay_image_path"] = overlay_path
-    ret["bundle_path"] = bundle_path
-    ret["pcds"] = {"before": bp, "after": ap, "aligned": aligned, "after_scene": after_scene_pcd}
-    return ret
-
-
-# ============================================================================
-# DOF artifact batch runner: replay(after) request.json memory_dir -> teach(before)
-# ============================================================================
 
 def _read_json_file(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
     if not isinstance(data, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return data
@@ -5919,21 +109,17 @@ def _find_dof_log_roots(root: str | os.PathLike[str]) -> list[Path]:
                 roots.append(log_root)
     deduped: list[Path] = []
     seen: set[str] = set()
-    for item in roots:
-        key = str(item)
+    for root_item in roots:
+        key = str(root_item)
         if key not in seen:
-            deduped.append(item)
+            deduped.append(root_item)
             seen.add(key)
     return deduped
 
 
 def _resolve_dof_memory_dir(replay_dir: Path, log_root: Path) -> tuple[Path | None, str]:
-    request_data: dict[str, Any] = {}
-    response_data: dict[str, Any] = {}
-    if (replay_dir / "request.json").is_file():
-        request_data = _read_json_file(replay_dir / "request.json")
-    if (replay_dir / "response.json").is_file():
-        response_data = _read_json_file(replay_dir / "response.json")
+    request_data = _read_json_file(replay_dir / "request.json") if (replay_dir / "request.json").is_file() else {}
+    response_data = _read_json_file(replay_dir / "response.json") if (replay_dir / "response.json").is_file() else {}
     memory_dir_raw = str(request_data.get("memory_dir") or response_data.get("memory_dir") or "").strip()
     if not memory_dir_raw:
         return None, ""
@@ -5958,16 +144,18 @@ def _iter_dof_pairs(root: str | os.PathLike[str]) -> list[dict[str, Any]]:
     pairs: list[dict[str, Any]] = []
     for log_root in _find_dof_log_roots(root):
         replay_root = log_root / "teach_dof_replay"
-        for replay_dir in sorted(p for p in replay_root.iterdir() if p.is_dir()):
+        for replay_dir in sorted(path for path in replay_root.iterdir() if path.is_dir()):
             if not (replay_dir / "request.json").is_file():
                 continue
             before_dir, memory_dir_raw = _resolve_dof_memory_dir(replay_dir, log_root)
-            pairs.append({
-                "log_root": log_root,
-                "before_dir": before_dir,
-                "replay_dir": replay_dir,
-                "memory_dir": memory_dir_raw,
-            })
+            pairs.append(
+                {
+                    "log_root": log_root,
+                    "before_dir": before_dir,
+                    "replay_dir": replay_dir,
+                    "memory_dir": memory_dir_raw,
+                }
+            )
     return pairs
 
 
@@ -5993,8 +181,7 @@ def _load_dof_intrinsics(artifact_dir: Path) -> dict[str, float]:
 
 
 def _mask_from_pixels(pixel_path: Path, height: int, width: int) -> np.ndarray:
-    pixels = np.load(str(pixel_path))
-    pixels = np.asarray(pixels)
+    pixels = np.asarray(np.load(str(pixel_path)))
     if pixels.ndim != 2 or pixels.shape[1] != 2:
         raise ValueError(f"Expected Nx2 pixel array: {pixel_path}, got {pixels.shape}")
     xy = np.rint(pixels).astype(np.int64)
@@ -6006,58 +193,1810 @@ def _mask_from_pixels(pixel_path: Path, height: int, width: int) -> np.ndarray:
     return mask
 
 
-def _load_dof_mask(artifact_dir: Path, height: int, width: int, is_replay: bool, use_trimmed: bool) -> np.ndarray:
-    if is_replay:
-        selected = "current_object_selected_pixels_xy.npy"
-        trimmed = "current_object_trimmed_pixels_xy.npy"
-    else:
-        selected = "object_selected_pixels_xy.npy"
-        trimmed = "object_trimmed_pixels_xy.npy"
-    names = [trimmed, selected] if use_trimmed else [selected, trimmed]
-    for name in names:
-        path = artifact_dir / name
+def _load_dof_mask(artifact_dir: Path, height: int, width: int, is_replay: bool) -> np.ndarray:
+    name = "current_object_selected_pixels_xy.npy" if is_replay else "object_selected_pixels_xy.npy"
+    path = artifact_dir / name
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing object pixel mask: {path}")
+    return _mask_from_pixels(path, height, width)
+
+
+def _load_json_if_present(path: Path) -> dict[str, Any]:
+    return _read_json_file(path) if path.is_file() else {}
+
+
+def _artifact_object_prefix(is_replay: bool) -> str:
+    return "current_object_selected" if is_replay else "object_selected"
+
+
+def _load_cached_object_arrays(artifact_dir: Path, is_replay: bool) -> dict[str, Any]:
+    prefix = _artifact_object_prefix(is_replay)
+    xyz_path = artifact_dir / f"{prefix}_xyz.npy"
+    rgb_path = artifact_dir / f"{prefix}_rgb.npy"
+    pixel_path = artifact_dir / f"{prefix}_pixels_xy.npy"
+    if not (xyz_path.is_file() and rgb_path.is_file() and pixel_path.is_file()):
+        return {}
+
+    xyz = np.asarray(np.load(str(xyz_path)), dtype=np.float32).reshape(-1, 3)
+    rgb = np.asarray(np.load(str(rgb_path)), dtype=np.float32).reshape(-1, 3)
+    pixels_xy = np.asarray(np.load(str(pixel_path)))
+    if pixels_xy.ndim != 2 or pixels_xy.shape[1] != 2:
+        raise ValueError(f"Expected Nx2 pixel array: {pixel_path}, got {pixels_xy.shape}")
+
+    n = min(len(xyz), len(rgb), len(pixels_xy))
+    xyz = xyz[:n]
+    rgb = rgb[:n]
+    pixels_xy = np.asarray(pixels_xy[:n], dtype=np.float32)
+    finite = np.isfinite(xyz).all(axis=1)
+    if np.issubdtype(rgb.dtype, np.number):
+        finite &= np.isfinite(rgb).all(axis=1)
+    xyz = xyz[finite]
+    rgb = rgb[finite]
+    pixels_xy = pixels_xy[finite]
+    return {
+        "point_xyz": xyz,
+        "point_rgb": np.clip(rgb, 0.0, 1.0).astype(np.float32),
+        "pixels_xy": pixels_xy,
+        "prefix": prefix,
+        "points": int(len(xyz)),
+        "xyz_path": str(xyz_path),
+        "rgb_path": str(rgb_path),
+        "pixel_path": str(pixel_path),
+    }
+
+
+def _compute_axes_from_points(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if len(pts) < 3:
+        return np.eye(3, dtype=np.float64), pts.mean(axis=0) if len(pts) else np.zeros(3, dtype=np.float64)
+    center = pts.mean(axis=0)
+    pts0 = pts - center
+    _, _, vh = np.linalg.svd(pts0, full_matrices=False)
+    axes = vh.T
+    if np.linalg.det(axes) < 0.0:
+        axes[:, -1] *= -1.0
+    return axes.astype(np.float64), center.astype(np.float64)
+
+
+def _load_reference_obb(artifact_dir: Path, response_data: dict[str, Any], cached_arrays: dict[str, Any]) -> dict[str, Any]:
+    obb_data: dict[str, Any] = {}
+    object_data = response_data.get("object")
+    if isinstance(object_data, dict):
+        fast_obb = object_data.get("fast_obb")
+        if isinstance(fast_obb, dict):
+            obb_data = fast_obb
+    if not obb_data:
+        path = artifact_dir / "object_fast_obb.json"
         if path.is_file():
-            return _mask_from_pixels(path, height, width)
-    raise FileNotFoundError(f"No object pixel mask found in {artifact_dir}")
+            obb_data = _read_json_file(path)
+
+    if obb_data:
+        axes = np.asarray(obb_data.get("axes", np.eye(3)), dtype=np.float64).reshape(3, 3)
+        center = np.asarray(obb_data.get("center_m", np.zeros(3)), dtype=np.float64).reshape(3)
+        if np.linalg.det(axes) < 0.0:
+            axes[:, -1] *= -1.0
+        return {
+            "axes": axes,
+            "center_m": center,
+        }
+
+    points = np.asarray(cached_arrays.get("point_xyz", np.zeros((0, 3), dtype=np.float32)), dtype=np.float64)
+    axes, center = _compute_axes_from_points(points)
+    return {
+        "axes": axes,
+        "center_m": center,
+    }
 
 
-def _load_dof_artifact_sample(artifact_dir: Path, is_replay: bool, use_trimmed_mask: bool) -> dict[str, Any]:
+def _load_selected_replay_pose(artifact_dir: Path) -> dict[str, Any]:
+    return _load_json_if_present(artifact_dir / "selected_replay_pose.json")
+
+
+def _build_pointcloud_from_cached(sample: dict[str, Any]) -> Any:
+    if o3d is None:
+        raise RuntimeError("open3d is required")
+    points = np.asarray(sample.get("object_xyz", np.zeros((0, 3), dtype=np.float32)), dtype=np.float64)
+    colors = np.asarray(sample.get("object_rgb", np.zeros((0, 3), dtype=np.float32)), dtype=np.float64)
+    if len(points) == 0:
+        return o3d.geometry.PointCloud()
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    if len(colors) == len(points):
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
+    return pcd
+
+
+def _prepare_registration_pcd(sample: dict[str, Any], cfg: RegistrationConfig) -> tuple[Any, dict[str, Any]]:
+    object_xyz = np.asarray(sample.get("object_xyz", np.zeros((0, 3), dtype=np.float32)))
+    object_rgb = np.asarray(sample.get("object_rgb", np.zeros((0, 3), dtype=np.float32)))
+    if len(object_xyz) == 0:
+        raise ValueError("Cached object_xyz is required for pose re-estimation.")
+    pcd = _reestimate_pcd_normals(_build_pointcloud_from_cached(sample), cfg)
+    return pcd, {
+        "source": "cached_object_xyz",
+        "input_points": int(len(object_xyz)),
+        "used_points": int(len(pcd.points)),
+        "representative_points": int(len(pcd.points)),
+        "applied": False,
+        "strategy": "cached_exact",
+        "voxel_size_m": 0.0,
+        "raw_rgb_points": int(len(object_rgb)),
+        "preprocess_mode": "normals_only",
+    }
+
+
+def _reestimate_pcd_normals(pcd: Any, cfg: RegistrationConfig) -> Any:
+    if o3d is None or len(pcd.points) == 0:
+        return pcd
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=cfg.normal_radius,
+            max_nn=cfg.normal_max_nn,
+        )
+    )
+    pcd.normalize_normals()
+    return pcd
+
+
+def _cap_registration_working_pcd(
+    pcd: Any,
+    cfg: RegistrationConfig,
+    max_points: int,
+    random_seed: int,
+) -> tuple[Any, dict[str, Any]]:
+    input_points = int(len(pcd.points))
+    if max_points <= 0 or input_points <= max_points:
+        return copy_pcd(pcd), {
+            "input_points": input_points,
+            "used_points": input_points,
+            "target_points": int(max_points),
+            "applied": False,
+            "strategy": "identity",
+            "voxel_size_m": 0.0,
+            "random_subsample_applied": False,
+        }
+
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    extents = np.ptp(pts, axis=0) if len(pts) else np.zeros(3, dtype=np.float64)
+    diag = float(np.linalg.norm(extents))
+    base_voxel = max(diag / max(math.sqrt(float(max_points)), 1.0), 1e-4)
+    scales = (0.45, 0.60, 0.75, 0.90, 1.0, 1.15, 1.35, 1.60, 2.0)
+    best_pcd = None
+    best_count = input_points
+    best_voxel = 0.0
+    best_key = (math.inf, 1, input_points)
+    for scale in scales:
+        voxel = float(base_voxel * scale)
+        candidate = pcd.voxel_down_sample(voxel)
+        count = int(len(candidate.points))
+        if count <= 0:
+            continue
+        key = (abs(count - int(max_points)), 0 if count <= int(max_points) else 1, count)
+        if key < best_key:
+            best_key = key
+            best_pcd = candidate
+            best_count = count
+            best_voxel = voxel
+    if best_pcd is None:
+        best_pcd = copy_pcd(pcd)
+        best_count = int(len(best_pcd.points))
+        best_voxel = 0.0
+
+    random_subsample_applied = False
+    if best_count > int(max_points):
+        rng = np.random.default_rng(int(random_seed))
+        keep = np.sort(rng.choice(best_count, int(max_points), replace=False)).tolist()
+        best_pcd = best_pcd.select_by_index(keep)
+        best_count = int(len(best_pcd.points))
+        random_subsample_applied = True
+
+    best_pcd = _reestimate_pcd_normals(best_pcd, cfg)
+    return best_pcd, {
+        "input_points": input_points,
+        "used_points": best_count,
+        "target_points": int(max_points),
+        "applied": bool(best_count != input_points),
+        "strategy": "adaptive_voxel_cap",
+        "voxel_size_m": float(best_voxel),
+        "random_subsample_applied": bool(random_subsample_applied),
+        "bbox_diag_m": float(diag),
+    }
+
+
+def _load_dof_artifact_sample(artifact_dir: Path, is_replay: bool) -> dict[str, Any]:
     image_path = artifact_dir / "image_left.png"
     depth_path = artifact_dir / "dense_map_cam.npy"
     if not image_path.is_file():
         raise FileNotFoundError(f"Missing image_left.png: {artifact_dir}")
     if not depth_path.is_file():
         raise FileNotFoundError(f"Missing dense_map_cam.npy: {artifact_dir}")
+
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise ValueError(f"Failed to read image: {image_path}")
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     height, width = image_rgb.shape[:2]
     depth = depth_to_meters(np.load(str(depth_path)), target_hw=(height, width))
-    mask = _load_dof_mask(artifact_dir, height, width, is_replay=is_replay, use_trimmed=use_trimmed_mask)
+    mask = _load_dof_mask(artifact_dir, height, width, is_replay=is_replay)
     intr = _load_dof_intrinsics(artifact_dir)
-    K = CameraIntrinsics(
-        fx=intr["fx"], fy=intr["fy"], cx=intr["cx"], cy=intr["cy"],
-        width=width, height=height,
+    request_data = _load_json_if_present(artifact_dir / "request.json")
+    response_data = _load_json_if_present(artifact_dir / "response.json")
+    experiment_config = _load_json_if_present(artifact_dir / "replay_experiment_config.json")
+    cached_arrays = _load_cached_object_arrays(artifact_dir, is_replay=is_replay)
+    object_obb = _load_reference_obb(artifact_dir, response_data, cached_arrays) if not is_replay else {}
+    selected_replay_pose = _load_selected_replay_pose(artifact_dir) if is_replay else {}
+    camera_intr = CameraIntrinsics(
+        fx=intr["fx"],
+        fy=intr["fy"],
+        cx=intr["cx"],
+        cy=intr["cy"],
+        width=width,
+        height=height,
     )
-    segment_name = "current_object_segment.json" if is_replay else "object_segment.json"
-    segment = _read_json_file(artifact_dir / segment_name) if (artifact_dir / segment_name).is_file() else {}
     return {
+        "artifact_dir": artifact_dir,
         "rgb": image_rgb,
         "depth": depth,
         "mask": mask,
-        "K": K,
-        "intrinsics": intr,
-        "bbox": segment.get("bbox_xyxy"),
-        "segment": segment,
+        "K": camera_intr,
+        "request": request_data,
+        "response": response_data,
+        "experiment_config": experiment_config,
+        "object_xyz": np.asarray(cached_arrays.get("point_xyz", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32),
+        "object_rgb": np.asarray(cached_arrays.get("point_rgb", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32),
+        "object_pixels_xy": np.asarray(cached_arrays.get("pixels_xy", np.zeros((0, 2), dtype=np.float32)), dtype=np.float32),
+        "object_points": int(cached_arrays.get("points", 0)),
+        "object_obb": object_obb,
+        "selected_replay_pose": selected_replay_pose,
     }
 
 
-def _dof_result_row(pair: dict[str, Any], save_dir: Path | None = None) -> dict[str, Any]:
+def _draw_mask_overlay(image_rgb: np.ndarray, mask: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:
+    output = np.asarray(image_rgb, dtype=np.uint8).copy()
+    mask_bool = np.asarray(mask) > 0
+    if mask_bool.ndim == 3:
+        mask_bool = mask_bool[:, :, 0]
+    color_arr = np.asarray(color, dtype=np.float32)
+    output[mask_bool] = np.clip(0.6 * output[mask_bool].astype(np.float32) + 0.4 * color_arr, 0, 255).astype(np.uint8)
+    edge = mask_bool.astype(np.uint8) - cv2.erode(mask_bool.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1)
+    output[edge > 0] = color
+    return output
+
+
+def _project_points_to_image(points_cam: np.ndarray, intr: CameraIntrinsics, image_shape: tuple[int, int]) -> np.ndarray:
+    points = np.asarray(points_cam, dtype=np.float64).reshape(-1, 3)
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    z = points[:, 2]
+    valid = np.isfinite(points).all(axis=1) & (z > 1e-6)
+    if not np.any(valid):
+        return np.zeros((0, 2), dtype=np.int32)
+    pts = points[valid]
+    u = np.round((pts[:, 0] * intr.fx / pts[:, 2]) + intr.cx).astype(np.int32)
+    v = np.round((pts[:, 1] * intr.fy / pts[:, 2]) + intr.cy).astype(np.int32)
+    height, width = image_shape
+    inside = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    if not np.any(inside):
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.column_stack([u[inside], v[inside]]).astype(np.int32)
+
+
+def _draw_registration_overlay(after_rgb: np.ndarray, after_mask: np.ndarray, aligned_pcd, intr: CameraIntrinsics) -> np.ndarray:
+    left = _draw_mask_overlay(after_rgb, after_mask, color=(255, 166, 77))
+    right = left.copy()
+    uv = _project_points_to_image(np.asarray(aligned_pcd.points), intr, after_rgb.shape[:2])
+    if len(uv) > 3000:
+        keep = np.random.default_rng(42).choice(len(uv), 3000, replace=False)
+        uv = uv[keep]
+    proj_mask, uv_filtered = projected_uv_to_mask(uv, after_rgb.shape[:2], point_radius_px=1, connect_radius_px=3)
+    for x, y in uv_filtered:
+        cv2.circle(right, (int(x), int(y)), 1, (76, 175, 255), -1, cv2.LINE_AA)
+    contours, _ = cv2.findContours(proj_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        cv2.drawContours(right, [largest], -1, (76, 175, 255), 2, cv2.LINE_AA)
+    cv2.putText(left, "After target mask", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
+    cv2.putText(right, "After + TAPIR aligned projection", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
+    divider = np.full((after_rgb.shape[0], 10, 3), 18, dtype=np.uint8)
+    return np.concatenate([left, divider, right], axis=1)
+
+
+def _rigid_inverse(T: np.ndarray) -> np.ndarray:
+    tform = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    inv = np.eye(4, dtype=np.float64)
+    inv[:3, :3] = tform[:3, :3].T
+    inv[:3, 3] = -(tform[:3, :3].T @ tform[:3, 3])
+    return inv
+
+
+def _transform_points(points: np.ndarray, T: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if len(pts) == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+    tform = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    return (pts @ tform[:3, :3].T) + tform[:3, 3]
+
+
+def _rotation_angle_deg(R: np.ndarray) -> float:
+    rot = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    val = np.clip((np.trace(rot) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(val)))
+
+
+def _transform_from_axes(ref_axes: np.ndarray, ref_center: np.ndarray, cur_axes: np.ndarray, cur_center: np.ndarray) -> np.ndarray:
+    R = np.asarray(cur_axes, dtype=np.float64).reshape(3, 3) @ np.asarray(ref_axes, dtype=np.float64).reshape(3, 3).T
+    t = np.asarray(cur_center, dtype=np.float64).reshape(3) - (R @ np.asarray(ref_center, dtype=np.float64).reshape(3))
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    return T
+
+
+def _compute_current_pca_obb(sample: dict[str, Any]) -> dict[str, Any]:
+    points = np.asarray(sample.get("object_xyz", np.zeros((0, 3), dtype=np.float32)), dtype=np.float64)
+    axes, center = _compute_axes_from_points(points)
+    return {
+        "axes": axes,
+        "center_m": center,
+    }
+
+
+def _build_axis_permutation_candidates(ref_obb: dict[str, Any], cur_obb: dict[str, Any]) -> list[SeedCandidate]:
+    ref_axes = np.asarray(ref_obb.get("axes", np.eye(3)), dtype=np.float64).reshape(3, 3)
+    ref_center = np.asarray(ref_obb.get("center_m", np.zeros(3)), dtype=np.float64).reshape(3)
+    cur_axes = np.asarray(cur_obb.get("axes", np.eye(3)), dtype=np.float64).reshape(3, 3)
+    cur_center = np.asarray(cur_obb.get("center_m", np.zeros(3)), dtype=np.float64).reshape(3)
+    candidates: list[SeedCandidate] = []
+    seen: list[np.ndarray] = []
+    basis = np.eye(3, dtype=np.float64)
+    for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
+        P = basis[:, perm]
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                S = np.diag([sx, sy, 1.0])
+                cand_axes = cur_axes @ P @ S
+                if np.linalg.det(cand_axes) < 0.0:
+                    cand_axes[:, -1] *= -1.0
+                T = _transform_from_axes(ref_axes, ref_center, cand_axes, cur_center)
+                R = T[:3, :3]
+                duplicate = any(np.allclose(R, prev, atol=1e-6) for prev in seen)
+                if duplicate:
+                    continue
+                seen.append(R.copy())
+                candidates.append(
+                    SeedCandidate(
+                        tag="pca_perm",
+                        T_init=T,
+                        score_hint=0.02,
+                        search_mode="fallback_light",
+                        metadata={
+                            "perm": list(perm),
+                            "sign_x": sx,
+                            "sign_y": sy,
+                        },
+                    )
+                )
+    return candidates
+
+
+def _reconstruct_tapir_transform(result: Any) -> np.ndarray | None:
+    if result is None:
+        return None
+    T = getattr(result, "T_before_cam_to_after_cam", None)
+    if T is not None:
+        return np.asarray(T, dtype=np.float64).reshape(4, 4)
+    debug = getattr(result, "debug", {}) or {}
+    rot = debug.get("prior_rotation")
+    trans = debug.get("prior_translation")
+    if rot is None or trans is None:
+        return None
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = np.asarray(rot, dtype=np.float64).reshape(3, 3)
+    T[:3, 3] = np.asarray(trans, dtype=np.float64).reshape(3)
+    return T
+
+
+def _rotation_delta_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    R_rel = np.asarray(R_a, dtype=np.float64).reshape(3, 3) @ np.asarray(R_b, dtype=np.float64).reshape(3, 3).T
+    trace = float(np.trace(R_rel))
+    cos_theta = np.clip((trace - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
+def _seed_rank_score(candidate: SeedCandidate, reference_T: np.ndarray | None) -> float:
+    T = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
+    if reference_T is None:
+        rot_score = _rotation_delta_deg(T[:3, :3], np.eye(3, dtype=np.float64))
+        trans_score = float(np.linalg.norm(T[:3, 3]))
+    else:
+        ref_T = np.asarray(reference_T, dtype=np.float64).reshape(4, 4)
+        rot_score = _rotation_delta_deg(T[:3, :3], ref_T[:3, :3])
+        trans_score = float(np.linalg.norm(T[:3, 3] - ref_T[:3, 3]))
+    return float(rot_score + trans_score * 1000.0)
+
+
+def _candidate_signature(candidate: SeedCandidate) -> tuple[float, ...]:
+    T = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
+    mode_signature = float(sum(ord(ch) for ch in str(candidate.search_mode or "")))
+    return tuple(np.round(np.concatenate([[mode_signature], T[:3, :3].reshape(-1), T[:3, 3]]), 4).tolist())
+
+
+def _append_unique_seed(candidates: list[SeedCandidate], candidate: SeedCandidate | None, seen: set[tuple[float, ...]]) -> bool:
+    if candidate is None:
+        return False
+    signature = _candidate_signature(candidate)
+    if signature in seen:
+        return False
+    seen.add(signature)
+    candidates.append(candidate)
+    return True
+
+
+def _take_ranked_candidates(
+    base_candidates: list[SeedCandidate],
+    limit: int,
+    reference_T: np.ndarray | None,
+) -> list[SeedCandidate]:
+    if limit <= 0:
+        return []
+    ranked = sorted(base_candidates, key=lambda candidate: (_seed_rank_score(candidate, reference_T), candidate.tag))
+    return ranked[:limit]
+
+
+def _build_fallback_seed_candidates(
+    ref_obb: dict[str, Any],
+    cur_obb: dict[str, Any],
+    reference_T: np.ndarray | None,
+    candidate_limit: int = 16,
+) -> tuple[list[SeedCandidate], dict[str, int]]:
+    raw_pca_candidates = _build_axis_permutation_candidates(ref_obb, cur_obb)
+    selected_pca_candidates = _take_ranked_candidates(
+        raw_pca_candidates,
+        limit=int(candidate_limit),
+        reference_T=reference_T,
+    )
+    return selected_pca_candidates, {
+        "pca_candidate_count": int(len(raw_pca_candidates)),
+        "pca_candidates_used": int(len(selected_pca_candidates)),
+    }
+
+
+def _build_tapir_prior_keep_candidate(tapir_T: np.ndarray, tapir_debug: dict[str, Any]) -> SeedCandidate:
+    return SeedCandidate(
+        tag="tapir_prior_keep",
+        T_init=np.asarray(tapir_T, dtype=np.float64).reshape(4, 4),
+        score_hint=-0.24,
+        search_mode="tapir_prior_keep",
+        metadata={
+            "prior_dense_rmse_eval": float((tapir_debug or {}).get("prior_dense_rmse_eval", math.inf)),
+            "prior_dense_fitness_eval": float((tapir_debug or {}).get("prior_dense_fitness_eval", 0.0)),
+            "prior_proj_iou": float((tapir_debug or {}).get("prior_proj_iou", 0.0)),
+            "prior_proj_precision": float((tapir_debug or {}).get("prior_proj_precision", 0.0)),
+        },
+    )
+
+
+def _tapir_compare_refine_search_mode(tapir_debug: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
+    proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0) or 0.0)
+    proj_precision = float((tapir_debug or {}).get("prior_proj_precision", 0.0) or 0.0)
+    rel_dense_rmse = float((tapir_debug or {}).get("prior_dense_relative_rmse_eval", math.inf) or math.inf)
+
+    verify_ready = bool(
+        prior_confidence >= 0.56
+        and proj_iou >= 0.45
+        and proj_precision >= 0.60
+        and np.isfinite(rel_dense_rmse)
+        and rel_dense_rmse <= 0.065
+    )
+    if verify_ready:
+        return "tapir_micro_verify_strict", {
+            "compare_refine_mode": "micro_verify_strict",
+            "compare_refine_reason": "high_medium_confidence_prior_direct_gicp_verify",
+        }
+    return "tapir_micro_verify_relaxed", {
+        "compare_refine_mode": "micro_verify_relaxed",
+        "compare_refine_reason": "default_medium_band_direct_gicp_verify",
+    }
+
+
+def _tapir_compare_entry_decision(tapir_debug: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
+    proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0) or 0.0)
+    proj_precision = float((tapir_debug or {}).get("prior_proj_precision", 0.0) or 0.0)
+    rel_dense_rmse = float((tapir_debug or {}).get("prior_dense_relative_rmse_eval", math.inf) or math.inf)
+    inliers = int((tapir_debug or {}).get("num_inliers", (tapir_debug or {}).get("inlier_count", 0)) or 0)
+
+    compare_verify_confidence_thresh = 0.56
+    low_inlier_thresh = 4
+    low_proj_iou_thresh = 0.36
+    low_proj_precision_thresh = 0.52
+    weak_projection_support = bool(
+        proj_iou < low_proj_iou_thresh
+        and proj_precision < low_proj_precision_thresh
+    )
+    weak_medium_prior = bool(
+        prior_confidence < compare_verify_confidence_thresh
+        and inliers <= low_inlier_thresh
+        and weak_projection_support
+    )
+    return (not weak_medium_prior), {
+        "compare_entry_gate_ok": bool(not weak_medium_prior),
+        "compare_entry_reason": (
+            "weak_medium_prior_low_projection_support" if weak_medium_prior else "tapir_compare_allowed"
+        ),
+        "compare_entry_verify_confidence_thresh": float(compare_verify_confidence_thresh),
+        "compare_entry_low_inlier_thresh": int(low_inlier_thresh),
+        "compare_entry_low_proj_iou_thresh": float(low_proj_iou_thresh),
+        "compare_entry_low_proj_precision_thresh": float(low_proj_precision_thresh),
+        "compare_entry_prior_confidence": float(prior_confidence),
+        "compare_entry_proj_iou": float(proj_iou),
+        "compare_entry_proj_precision": float(proj_precision),
+        "compare_entry_rel_dense_rmse": float(rel_dense_rmse),
+        "compare_entry_inliers": int(inliers),
+    }
+
+
+def _tapir_prior_keep_debug(candidate: SeedCandidate) -> dict[str, Any]:
+    metadata = candidate.metadata or {}
+    prior_rmse = float(metadata.get("prior_dense_rmse_eval", math.inf))
+    prior_fitness = float(metadata.get("prior_dense_fitness_eval", 0.0))
+    prior_proj_iou = float(metadata.get("prior_proj_iou", 0.0))
+    return {
+        "search_mode": "tapir_prior_keep",
+        "coarse_score": float("nan"),
+        "coarse_ms": 0,
+        "coarse_skipped": True,
+        "fine_score": float("nan"),
+        "fine_ms": 0,
+        "gicp_fitness": prior_fitness,
+        "gicp_inlier_rmse": prior_rmse,
+        "gicp_visibility_score": 0.0,
+        "gicp_projection_iou": prior_proj_iou,
+        "gicp_ms": 0,
+        "colored_icp_disabled": True,
+        "colored_icp_rejected": True,
+        "colored_icp_reject_reasons": ["tapir_prior_keep"],
+        "colored_icp_effective_source": "tapir_prior_keep",
+        "colored_icp_fitness": prior_fitness,
+        "colored_icp_inlier_rmse": prior_rmse,
+        "colored_icp_ms": 0,
+        "total_reg_ms": 0,
+    }
+
+
+def _build_seed_candidates(before: dict[str, Any], after: dict[str, Any], tapir_raw: Any, tapir_debug: dict[str, Any]) -> tuple[list[SeedCandidate], dict[str, Any]]:
+    candidates: list[SeedCandidate] = []
+    seed_debug: dict[str, Any] = {}
+    seen: set[tuple[float, ...]] = set()
+    tapir_T = _reconstruct_tapir_transform(tapir_raw)
+    tapir_gate_ok = bool((tapir_debug or {}).get("prior_gate_decision", False))
+    tapir_strong_ok = bool((tapir_debug or {}).get("prior_gate_strong_3d_ok", False))
+    tapir_borderline_ok = bool((tapir_debug or {}).get("prior_gate_borderline_override", False))
+    tapir_compare_search_mode, tapir_compare_mode_debug = _tapir_compare_refine_search_mode(tapir_debug or {})
+    tapir_compare_entry_ok, tapir_compare_entry_debug = _tapir_compare_entry_decision(tapir_debug or {})
+    tapir_seed = None
+    if tapir_T is not None:
+        tapir_seed = SeedCandidate(
+            tag="tapir_prior_local_refine",
+            T_init=tapir_T,
+            score_hint=(-0.20 if tapir_strong_ok else (-0.08 if tapir_gate_ok else 0.18)),
+            search_mode=tapir_compare_search_mode,
+            metadata=dict(tapir_compare_mode_debug),
+        )
+
+    ref_obb = before.get("object_obb") or _compute_current_pca_obb(before)
+    cur_obb = after.get("object_obb") or _compute_current_pca_obb(after)
+    fallback_candidates, fallback_seed_stats = _build_fallback_seed_candidates(ref_obb, cur_obb, tapir_T)
+    tapir_proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0))
+    tapir_inliers = int((tapir_debug or {}).get("num_inliers", (tapir_debug or {}).get("inlier_count", 0)) or 0)
+    prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
+    prior_confidence_accept = float((tapir_debug or {}).get("prior_confidence_accept_thresh", 0.0) or 0.0)
+    prior_confidence_strong = float((tapir_debug or {}).get("prior_confidence_strong_thresh", 1.0) or 1.0)
+    confidence_tier = "fallback"
+    compare_entry_routed_to_fallback = bool(
+        tapir_T is not None
+        and tapir_gate_ok
+        and tapir_seed is not None
+        and not tapir_strong_ok
+        and not tapir_compare_entry_ok
+    )
+
+    seed_policy = "fallback_search"
+    if tapir_T is not None and tapir_strong_ok:
+        seed_policy = "tapir_prior_direct"
+        confidence_tier = "strong"
+        _append_unique_seed(candidates, _build_tapir_prior_keep_candidate(tapir_T, tapir_debug), seen)
+    elif tapir_T is not None and tapir_gate_ok and tapir_seed is not None and tapir_compare_entry_ok:
+        seed_policy = "tapir_prior_compare"
+        confidence_tier = "borderline" if tapir_borderline_ok and prior_confidence < prior_confidence_accept else "medium"
+        _append_unique_seed(candidates, _build_tapir_prior_keep_candidate(tapir_T, tapir_debug), seen)
+        _append_unique_seed(candidates, tapir_seed, seen)
+    else:
+        if compare_entry_routed_to_fallback:
+            confidence_tier = "medium_routed_fallback"
+        for candidate in fallback_candidates:
+            _append_unique_seed(candidates, candidate, seen)
+    seed_debug.update(
+        {
+            "seed_policy": seed_policy,
+            "candidate_ranking_topk": [],
+            **fallback_seed_stats,
+            "tapir_gate_ok": tapir_gate_ok,
+            "tapir_strong_ok": tapir_strong_ok,
+            "tapir_borderline_ok": tapir_borderline_ok,
+            "tapir_proj_iou": tapir_proj_iou,
+            "tapir_inliers": tapir_inliers,
+            **tapir_compare_mode_debug,
+            **tapir_compare_entry_debug,
+            "compare_entry_routed_to_fallback": bool(compare_entry_routed_to_fallback),
+            "tapir_prior_confidence": float(prior_confidence),
+            "tapir_prior_confidence_accept_thresh": float(prior_confidence_accept),
+            "tapir_prior_confidence_strong_thresh": float(prior_confidence_strong),
+            "tapir_prior_confidence_tier": confidence_tier,
+        }
+    )
+    return candidates, seed_debug
+
+
+def _projection_metrics(points_ref: np.ndarray, T_ref_to_cur: np.ndarray, cur_mask: np.ndarray, intr: CameraIntrinsics) -> dict[str, Any]:
+    uv = _project_points_to_image(_transform_points(points_ref, T_ref_to_cur), intr, cur_mask.shape[:2])
+    if len(uv) == 0:
+        return {"projection_precision": 0.0, "projection_iou": 0.0, "projection_pixels": 0}
+    pred_mask, _ = projected_uv_to_mask(uv, cur_mask.shape[:2], point_radius_px=1, connect_radius_px=3)
+    pred = pred_mask > 0
+    gt = np.asarray(cur_mask) > 0
+    inter = int(np.logical_and(pred, gt).sum())
+    pred_area = int(pred.sum())
+    union = int(np.logical_or(pred, gt).sum())
+    return {
+        "projection_precision": float(inter / max(pred_area, 1)),
+        "projection_iou": float(inter / max(union, 1)),
+        "projection_pixels": int(pred_area),
+    }
+
+
+def _evaluate_registration_transform(
+    src_pcd,
+    tgt_pcd,
+    T_candidate: np.ndarray,
+    after_depth_m: np.ndarray,
+    after_rgb: np.ndarray,
+    after_mask: np.ndarray,
+    after_intr: CameraIntrinsics,
+    cfg: RegistrationConfig,
+) -> dict[str, float]:
+    visibility = visibility_aware_score(
+        src_pcd_base=src_pcd,
+        tgt_pcd_base=tgt_pcd,
+        T_srcbase_to_tgtbase=T_candidate,
+        wrist_depth=after_depth_m,
+        wrist_rgb=after_rgb,
+        wrist_intr=after_intr,
+        T_wrist_to_base=np.eye(4, dtype=np.float64),
+        cfg=cfg,
+    )
+    proj_metrics = _projection_metrics(np.asarray(src_pcd.points, dtype=np.float64), T_candidate, after_mask, after_intr)
+    return {
+        "visibility_score": float(visibility.get("score", 0.0)),
+        "visible_count": float(visibility.get("visible_count", 0.0)),
+        "depth_ok_ratio": float(visibility.get("depth_ok_ratio", 0.0)),
+        "projection_iou": float(proj_metrics.get("projection_iou", 0.0)),
+        "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
+    }
+
+
+def _colored_icp_guard_decision(
+    T_gicp: np.ndarray,
+    gicp_fitness: float,
+    gicp_rmse: float,
+    gicp_eval: dict[str, float],
+    T_colored: np.ndarray,
+    colored_fitness: float,
+    colored_rmse: float,
+    colored_eval: dict[str, float],
+) -> dict[str, Any]:
+    reasons: list[str] = []
+
+    if not np.isfinite(colored_fitness) or colored_fitness <= 1e-6:
+        reasons.append("colored_icp_no_valid_correspondence")
+    if not np.isfinite(colored_rmse):
+        reasons.append("colored_icp_invalid_rmse")
+
+    if colored_eval.get("visibility_score", 0.0) <= -1e8 and gicp_eval.get("visibility_score", 0.0) > -1e8:
+        reasons.append("colored_icp_lost_visibility")
+    if colored_eval.get("projection_iou", 0.0) <= 1e-6 and gicp_eval.get("projection_iou", 0.0) >= 0.10:
+        reasons.append("colored_icp_lost_projection")
+    if gicp_fitness >= 0.20 and colored_fitness + 0.10 < gicp_fitness:
+        reasons.append("colored_icp_fitness_drop")
+    if (
+        np.isfinite(gicp_rmse)
+        and np.isfinite(colored_rmse)
+        and gicp_rmse > 1e-6
+        and colored_rmse > max(0.02, gicp_rmse * 1.8)
+    ):
+        reasons.append("colored_icp_rmse_spike")
+
+    rot_delta = np.asarray(T_colored, dtype=np.float64)[:3, :3] @ np.asarray(T_gicp, dtype=np.float64)[:3, :3].T
+    delta_angle_deg = _rotation_angle_deg(rot_delta)
+    delta_trans_m = float(
+        np.linalg.norm(
+            np.asarray(T_colored, dtype=np.float64)[:3, 3] - np.asarray(T_gicp, dtype=np.float64)[:3, 3]
+        )
+    )
+    severe_regression = (
+        colored_eval.get("visibility_score", 0.0) <= -1e8 < gicp_eval.get("visibility_score", 0.0)
+        or colored_eval.get("projection_iou", 0.0) + 0.10 < gicp_eval.get("projection_iou", 0.0)
+        or (gicp_fitness >= 0.20 and colored_fitness + 0.10 < gicp_fitness)
+    )
+    if (delta_angle_deg > 35.0 or delta_trans_m > 0.05) and severe_regression:
+        reasons.append("colored_icp_large_pose_jump")
+
+    return {
+        "reject": bool(reasons),
+        "reasons": reasons,
+        "delta_angle_deg": float(delta_angle_deg),
+        "delta_trans_m": float(delta_trans_m),
+        "gicp_visibility_score": float(gicp_eval.get("visibility_score", 0.0)),
+        "colored_visibility_score": float(colored_eval.get("visibility_score", 0.0)),
+        "gicp_projection_iou": float(gicp_eval.get("projection_iou", 0.0)),
+        "colored_projection_iou": float(colored_eval.get("projection_iou", 0.0)),
+    }
+
+
+def _selection_score(reg_debug: dict[str, Any], proj_metrics: dict[str, Any]) -> tuple[float, dict[str, Any]]:
+    weight = 0.38
+    target_rmse = 0.009
+    target_projection_iou = 0.46
+    target_projection_precision = 0.90
+    target_reg_fitness = 0.955
+    rmse = float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf)))
+    reg_fitness = float(reg_debug.get("colored_icp_fitness", reg_debug.get("gicp_fitness", 0.0)))
+    projection_iou = float(proj_metrics.get("projection_iou", 0.0))
+    projection_precision = float(proj_metrics.get("projection_precision", 0.0))
+    rmse_term = min(1.5, rmse / max(target_rmse, 1e-6)) if np.isfinite(rmse) else 1.5
+    iou_penalty = 0.08 * max(0.0, target_projection_iou - projection_iou)
+    precision_penalty = 0.18 * max(0.0, target_projection_precision - projection_precision)
+    fitness_penalty = 0.44 * max(0.0, target_reg_fitness - reg_fitness)
+    final_penalty = iou_penalty + precision_penalty + fitness_penalty
+    invalid_penalty = 0.0
+    if reg_fitness <= 1e-6:
+        invalid_penalty += 0.8
+    if projection_iou <= 1e-6:
+        invalid_penalty += 0.8
+    if projection_precision <= 1e-6:
+        invalid_penalty += 0.4
+    final_penalty += invalid_penalty
+    score = (weight * rmse_term) + final_penalty
+    return score, {
+        "selection_weight": weight,
+        "selection_target_rmse_m": target_rmse,
+        "selection_target_projection_iou": target_projection_iou,
+        "selection_target_projection_precision": target_projection_precision,
+        "selection_target_reg_fitness": target_reg_fitness,
+        "selection_reg_fitness": float(reg_fitness),
+        "selection_iou_penalty": float(iou_penalty),
+        "selection_precision_penalty": float(precision_penalty),
+        "selection_fitness_penalty": float(fitness_penalty),
+        "selection_invalid_penalty": float(invalid_penalty),
+        "final_selection_penalty": float(final_penalty),
+    }
+
+
+def _prior_compare_keep_decision(
+    best_result: dict[str, Any] | None,
+    prior_result: dict[str, Any] | None,
+) -> tuple[bool, dict[str, Any]]:
+    debug = {
+        "triggered": False,
+        "best_tag": str(((best_result or {}).get("candidate") or SeedCandidate(tag="", T_init=np.eye(4))).tag),
+        "prior_tag": str(((prior_result or {}).get("candidate") or SeedCandidate(tag="", T_init=np.eye(4))).tag),
+        "best_projection_iou": 0.0,
+        "best_projection_precision": 0.0,
+        "best_rmse_m": math.inf,
+        "best_fitness": 0.0,
+        "prior_projection_iou": 0.0,
+        "prior_projection_precision": 0.0,
+        "prior_rmse_m": math.inf,
+        "prior_fitness": 0.0,
+        "iou_gain": 0.0,
+        "precision_gain": 0.0,
+        "rmse_drop_m": 0.0,
+        "fitness_gain": 0.0,
+        "soft_tradeoff_accept": False,
+        "reason": "",
+    }
+    if best_result is None or prior_result is None:
+        return False, debug
+    best_candidate = best_result.get("candidate")
+    prior_candidate = prior_result.get("candidate")
+    if not isinstance(best_candidate, SeedCandidate) or not isinstance(prior_candidate, SeedCandidate):
+        return False, debug
+    if str(best_candidate.tag) == "tapir_prior_keep":
+        return False, debug
+
+    best_proj = dict(best_result.get("proj_metrics") or {})
+    prior_proj = dict(prior_result.get("proj_metrics") or {})
+    best_reg = dict(best_result.get("reg_debug") or {})
+    prior_reg = dict(prior_result.get("reg_debug") or {})
+    best_iou = float(best_proj.get("projection_iou", 0.0))
+    prior_iou = float(prior_proj.get("projection_iou", 0.0))
+    best_precision = float(best_proj.get("projection_precision", 0.0))
+    prior_precision = float(prior_proj.get("projection_precision", 0.0))
+    best_rmse = float(best_reg.get("colored_icp_inlier_rmse", best_reg.get("gicp_inlier_rmse", math.inf)))
+    prior_rmse = float(prior_reg.get("colored_icp_inlier_rmse", prior_reg.get("gicp_inlier_rmse", math.inf)))
+    best_fitness = float(best_reg.get("colored_icp_fitness", best_reg.get("gicp_fitness", 0.0)))
+    prior_fitness = float(prior_reg.get("colored_icp_fitness", prior_reg.get("gicp_fitness", 0.0)))
+    iou_gain = float(best_iou - prior_iou)
+    precision_gain = float(best_precision - prior_precision)
+    rmse_drop = float(prior_rmse - best_rmse) if np.isfinite(prior_rmse) and np.isfinite(best_rmse) else 0.0
+    fitness_gain = float(best_fitness - prior_fitness)
+    improves_iou = bool(best_iou > prior_iou + 1e-4)
+    improves_precision = bool(best_precision > prior_precision + 1e-4)
+    improves_rmse = bool(best_rmse + 1e-6 < prior_rmse) if np.isfinite(prior_rmse) else bool(np.isfinite(best_rmse))
+    improves_fitness = bool(best_fitness > prior_fitness + 1e-4)
+    strong_accept = bool(
+        improves_rmse
+        and (
+            (improves_iou and (improves_precision or improves_fitness))
+            or (improves_precision and improves_fitness)
+        )
+    )
+    soft_tradeoff_accept = bool(
+        not strong_accept
+        and improves_rmse
+        and iou_gain >= -0.035
+        and precision_gain >= 0.03
+        and fitness_gain >= 0.04
+        and rmse_drop >= max(0.0030, 0.20 * max(prior_rmse, 1e-6))
+        and best_iou >= max(0.22, prior_iou - 0.035)
+    )
+    high_iou_prior_tradeoff_accept = bool(
+        not strong_accept
+        and improves_rmse
+        and prior_iou >= 0.42
+        and iou_gain >= -0.055
+        and precision_gain >= -0.01
+        and fitness_gain >= 0.06
+        and rmse_drop >= max(0.0035, 0.22 * max(prior_rmse, 1e-6))
+    )
+    keep_prior = not (strong_accept or soft_tradeoff_accept or high_iou_prior_tradeoff_accept)
+    reason = ""
+    if keep_prior:
+        missing = []
+        if not improves_iou:
+            missing.append("iou")
+        if not improves_rmse:
+            missing.append("rmse")
+        if not improves_precision:
+            missing.append("precision")
+        if not improves_fitness:
+            missing.append("fitness")
+        reason = "refine_not_better_" + "_and_".join(missing)
+    elif strong_accept:
+        reason = "refine_multi_metric_win"
+    elif soft_tradeoff_accept:
+        reason = "refine_tradeoff_rmse_precision"
+    else:
+        reason = "refine_tradeoff_high_iou_prior"
+    debug.update(
+        {
+            "triggered": bool(keep_prior),
+            "best_projection_iou": float(best_iou),
+            "best_projection_precision": float(best_precision),
+            "best_rmse_m": float(best_rmse),
+            "best_fitness": float(best_fitness),
+            "prior_projection_iou": float(prior_iou),
+            "prior_projection_precision": float(prior_precision),
+            "prior_rmse_m": float(prior_rmse),
+            "prior_fitness": float(prior_fitness),
+            "iou_gain": float(iou_gain),
+            "precision_gain": float(precision_gain),
+            "rmse_drop_m": float(rmse_drop),
+            "fitness_gain": float(fitness_gain),
+            "soft_tradeoff_accept": bool(soft_tradeoff_accept),
+            "reason": reason,
+        }
+    )
+    return keep_prior, debug
+
+
+def _sample_projection_points(points: np.ndarray, max_points: int) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if len(pts) <= max_points:
+        return pts
+    max_points = max(1, int(max_points))
+    indices = np.linspace(0, len(pts) - 1, num=max_points, dtype=np.int32)
+    return pts[indices]
+
+
+def _prefilter_fallback_seed_candidates(
+    seed_candidates: list[SeedCandidate],
+    src_pcd,
+    tgt_pcd,
+    after: dict[str, Any],
+    intr: CameraIntrinsics,
+    cfg: RegistrationConfig,
+    keep_top_k: int = 4,
+) -> tuple[list[SeedCandidate], dict[str, Any]]:
+    if len(seed_candidates) <= max(1, int(keep_top_k)):
+        return list(seed_candidates), {
+            "enabled": False,
+            "reason": "candidate_count_not_exceed_topk",
+            "keep_top_k": int(keep_top_k),
+            "input_candidate_count": int(len(seed_candidates)),
+            "selected_candidate_count": int(len(seed_candidates)),
+            "selected_tags": [str(c.tag) for c in seed_candidates],
+            "ranking": [],
+        }
+
+    ref_proj_points = _sample_projection_points(np.asarray(src_pcd.points, dtype=np.float64), max_points=2048)
+    cheap_ranking: list[dict[str, Any]] = []
+    for index, candidate in enumerate(seed_candidates):
+        proj_metrics = _projection_metrics(
+            ref_proj_points,
+            np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4),
+            after["mask"],
+            intr,
+        )
+        proj_iou = float(proj_metrics.get("projection_iou", 0.0))
+        proj_precision = float(proj_metrics.get("projection_precision", 0.0))
+        cheap_score = (
+            proj_iou
+            + 0.35 * proj_precision
+            + 0.05 * float(candidate.score_hint)
+        )
+        cheap_ranking.append(
+            {
+                "index": int(index),
+                "tag": str(candidate.tag),
+                "search_mode": str(candidate.search_mode or "full"),
+                "cheap_score": float(cheap_score),
+                "projection_iou": proj_iou,
+                "projection_precision": proj_precision,
+                "score_hint": float(candidate.score_hint),
+            }
+        )
+
+    cheap_sorted = sorted(
+        cheap_ranking,
+        key=lambda item: (
+            -float(item["cheap_score"]),
+            -float(item["projection_iou"]),
+            -float(item["projection_precision"]),
+            int(item["index"]),
+        ),
+    )
+    keep_n = max(1, min(int(keep_top_k), len(seed_candidates)))
+    shortlist_n = max(keep_n + 1, min(len(seed_candidates), 6))
+    shortlist_items = cheap_sorted[:shortlist_n]
+    ranking: list[dict[str, Any]] = []
+    for item in shortlist_items:
+        candidate = seed_candidates[int(item["index"])]
+        eval_metrics = _evaluate_registration_transform(
+            src_pcd=src_pcd,
+            tgt_pcd=tgt_pcd,
+            T_candidate=np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4),
+            after_depth_m=after["depth"],
+            after_rgb=after["rgb"],
+            after_mask=after["mask"],
+            after_intr=intr,
+            cfg=cfg,
+        )
+        vis = float(eval_metrics.get("visibility_score", 0.0))
+        visible_count = float(eval_metrics.get("visible_count", 0.0))
+        invalid = bool(vis <= -1e8 or (item["projection_iou"] <= 1e-6 and item["projection_precision"] <= 1e-6))
+        pre_score = (
+            float(item["cheap_score"])
+            + 0.25 * float(np.clip(vis, 0.0, 1.0))
+            + 0.02 * float(max(visible_count, 0.0) > 0.0)
+        )
+        ranking.append(
+            {
+                **item,
+                "pre_score": float(pre_score),
+                "invalid": bool(invalid),
+                "visibility_score": vis,
+                "visible_count": visible_count,
+                "visibility_evaluated": True,
+            }
+        )
+    shortlist_indices = {int(item["index"]) for item in shortlist_items}
+    for item in cheap_sorted:
+        if int(item["index"]) in shortlist_indices:
+            continue
+        ranking.append(
+            {
+                **item,
+                "pre_score": float(item["cheap_score"]),
+                "invalid": bool(item["projection_iou"] <= 1e-6 and item["projection_precision"] <= 1e-6),
+                "visibility_score": float("nan"),
+                "visible_count": 0.0,
+                "visibility_evaluated": False,
+            }
+        )
+    ranking_sorted = sorted(
+        ranking,
+        key=lambda item: (
+            bool(item["invalid"]),
+            not bool(item["visibility_evaluated"]),
+            -float(item["pre_score"]),
+            -float(item["projection_iou"]),
+            -float(item["projection_precision"]),
+            int(item["index"]),
+        ),
+    )
+    selected_items = [
+        item
+        for item in ranking_sorted
+        if bool(item["visibility_evaluated"])
+    ][:keep_n]
+    selected_candidates: list[SeedCandidate] = []
+    for item in selected_items:
+        candidate = seed_candidates[int(item["index"])]
+        selected_candidates.append(
+            replace(
+                candidate,
+                metadata={
+                    **(candidate.metadata or {}),
+                    "prefilter_projection_iou": float(item["projection_iou"]),
+                    "prefilter_projection_precision": float(item["projection_precision"]),
+                    "prefilter_visibility_score": float(item["visibility_score"]),
+                    "prefilter_visible_count": float(item["visible_count"]),
+                    "prefilter_cheap_score": float(item["cheap_score"]),
+                    "prefilter_pre_score": float(item["pre_score"]),
+                },
+            )
+        )
+    return selected_candidates, {
+        "enabled": True,
+        "reason": "fallback_two_stage_prefilter",
+        "keep_top_k": int(keep_n),
+        "shortlist_count": int(shortlist_n),
+        "input_candidate_count": int(len(seed_candidates)),
+        "selected_candidate_count": int(len(selected_candidates)),
+        "selected_tags": [str(candidate.tag) for candidate in selected_candidates],
+        "ranking": ranking_sorted,
+    }
+
+
+def coarse_fine_registration(
+    src_pcd,
+    tgt_pcd,
+    T_init: np.ndarray,
+    after_depth_m: np.ndarray,
+    after_rgb: np.ndarray,
+    after_mask: np.ndarray,
+    after_intr: CameraIntrinsics,
+    cfg: RegistrationConfig,
+    search_mode: str = "full",
+) -> tuple[np.ndarray, dict[str, Any]]:
+    debug: dict[str, Any] = {}
+    t0 = time.perf_counter()
+    T_camera = np.eye(4, dtype=np.float64)
+    debug["search_mode"] = str(search_mode)
+    refine_cfg = cfg
+
+    if search_mode in {
+        "tapir_local_fast",
+        "tapir_local_verify",
+        "tapir_micro_verify_strict",
+        "tapir_micro_verify_relaxed",
+        "fallback_light",
+    }:
+        T_coarse = np.asarray(T_init, dtype=np.float64).reshape(4, 4)
+        coarse_info = {"score": math.nan, "skipped": True}
+        debug["coarse_score"] = float("nan")
+        debug["coarse_ms"] = 0
+        debug["coarse_skipped"] = True
+    else:
+        coarse_cfg = replace(
+            cfg,
+            search_rx_deg=(-45.0, -20.0, 0.0, 20.0, 45.0),
+            search_ry_deg=(-45.0, -20.0, 0.0, 20.0, 45.0),
+            search_rz_deg=(-120.0, -60.0, 0.0, 60.0, 120.0),
+            search_tx_m=(-0.02, 0.0, 0.02),
+            search_ty_m=(-0.02, 0.0, 0.02),
+            search_tz_m=(-0.02, 0.0, 0.02),
+        )
+        T_coarse, coarse_info = local_hypothesis_search(
+            src_head_pcd_base=src_pcd,
+            tgt_pcd_base=tgt_pcd,
+            T_init=T_init,
+            wrist_depth_m=after_depth_m,
+            wrist_rgb=after_rgb,
+            wrist_intr=after_intr,
+            T_wrist_to_base=T_camera,
+            cfg=coarse_cfg,
+        )
+        debug["coarse_score"] = coarse_info.get("score", -1e9)
+        debug["coarse_ms"] = int(round((time.perf_counter() - t0) * 1000.0))
+
+    t1 = time.perf_counter()
+    if search_mode == "tapir_micro_verify_strict":
+        T_search = T_coarse
+        fine_info = {"score": math.nan, "skipped": True}
+        debug["fine_score"] = float("nan")
+        debug["fine_ms"] = 0
+        debug["fine_skipped"] = True
+        refine_cfg = replace(
+            cfg,
+            gicp_max_iter=min(int(cfg.gicp_max_iter), 12),
+            use_colored_icp=False,
+            colored_icp_max_iter=0,
+        )
+    elif search_mode == "tapir_micro_verify_relaxed":
+        T_search = T_coarse
+        fine_info = {"score": math.nan, "skipped": True}
+        debug["fine_score"] = float("nan")
+        debug["fine_ms"] = 0
+        debug["fine_skipped"] = True
+        refine_cfg = replace(
+            cfg,
+            gicp_max_iter=min(int(cfg.gicp_max_iter), 20),
+            use_colored_icp=False,
+            colored_icp_max_iter=0,
+        )
+    elif search_mode == "tapir_local_fast":
+        fine_cfg = replace(
+            cfg,
+            search_rx_deg=(-3.0, 0.0, 3.0),
+            search_ry_deg=(-3.0, 0.0, 3.0),
+            search_rz_deg=(-4.0, 0.0, 4.0),
+            search_tx_m=(0.0,),
+            search_ty_m=(0.0,),
+            search_tz_m=(0.0,),
+        )
+        refine_cfg = replace(
+            cfg,
+            gicp_max_iter=min(int(cfg.gicp_max_iter), 36),
+            colored_icp_max_iter=min(int(cfg.colored_icp_max_iter), 16),
+        )
+    elif search_mode == "tapir_local_verify":
+        fine_cfg = replace(
+            cfg,
+            search_rx_deg=(-2.0, 0.0, 2.0),
+            search_ry_deg=(-2.0, 0.0, 2.0),
+            search_rz_deg=(-3.0, 0.0, 3.0),
+            search_tx_m=(0.0,),
+            search_ty_m=(0.0,),
+            search_tz_m=(0.0,),
+        )
+        refine_cfg = replace(
+            cfg,
+            gicp_max_iter=min(int(cfg.gicp_max_iter), 18),
+            colored_icp_max_iter=min(int(cfg.colored_icp_max_iter), 8),
+        )
+    elif search_mode == "fallback_light":
+        fine_cfg = replace(
+            cfg,
+            search_rx_deg=(-6.0, 0.0, 6.0),
+            search_ry_deg=(-6.0, 0.0, 6.0),
+            search_rz_deg=(-10.0, 0.0, 10.0),
+            search_tx_m=(0.0,),
+            search_ty_m=(0.0,),
+            search_tz_m=(0.0,),
+        )
+        refine_cfg = replace(
+            cfg,
+            gicp_max_iter=min(int(cfg.gicp_max_iter), 24),
+            colored_icp_max_iter=min(int(cfg.colored_icp_max_iter), 12),
+        )
+    else:
+        fine_cfg = replace(
+            cfg,
+            search_rx_deg=(-8.0, -4.0, 0.0, 4.0, 8.0),
+            search_ry_deg=(-8.0, -4.0, 0.0, 4.0, 8.0),
+            search_rz_deg=(-10.0, -5.0, 0.0, 5.0, 10.0),
+            search_tx_m=(-0.004, 0.0, 0.004),
+            search_ty_m=(-0.004, 0.0, 0.004),
+            search_tz_m=(-0.004, 0.0, 0.004),
+        )
+    if search_mode not in {"tapir_micro_verify_strict", "tapir_micro_verify_relaxed"}:
+        T_search, fine_info = local_hypothesis_search(
+            src_head_pcd_base=src_pcd,
+            tgt_pcd_base=tgt_pcd,
+            T_init=T_coarse,
+            wrist_depth_m=after_depth_m,
+            wrist_rgb=after_rgb,
+            wrist_intr=after_intr,
+            T_wrist_to_base=T_camera,
+            cfg=fine_cfg,
+        )
+        debug["fine_score"] = fine_info.get("score", -1e9)
+        debug["fine_ms"] = int(round((time.perf_counter() - t1) * 1000.0))
+
+    t_gicp = time.perf_counter()
+    T_gicp, gicp_res = refine_with_gicp(src_pcd, tgt_pcd, T_search, refine_cfg)
+    debug["gicp_fitness"] = float(gicp_res.fitness)
+    debug["gicp_inlier_rmse"] = float(gicp_res.inlier_rmse)
+    debug["gicp_ms"] = int(round((time.perf_counter() - t_gicp) * 1000.0))
+    gicp_eval = _evaluate_registration_transform(
+        src_pcd=src_pcd,
+        tgt_pcd=tgt_pcd,
+        T_candidate=T_gicp,
+        after_depth_m=after_depth_m,
+        after_rgb=after_rgb,
+        after_mask=after_mask,
+        after_intr=after_intr,
+        cfg=cfg,
+    )
+    debug["gicp_visibility_score"] = float(gicp_eval["visibility_score"])
+    debug["gicp_projection_iou"] = float(gicp_eval["projection_iou"])
+
+    T_final = T_gicp
+    t_colored = time.perf_counter()
+    if not bool(getattr(refine_cfg, "use_colored_icp", False)):
+        debug["colored_icp_disabled"] = True
+        debug["colored_icp_rejected"] = True
+        debug["colored_icp_reject_reasons"] = ["colored_icp_disabled"]
+        debug["colored_icp_effective_source"] = "gicp_fallback"
+        debug["colored_icp_fitness"] = debug["gicp_fitness"]
+        debug["colored_icp_inlier_rmse"] = debug["gicp_inlier_rmse"]
+    else:
+        try:
+            T_colored, colored_res = refine_with_colored_icp(src_pcd, tgt_pcd, T_gicp, refine_cfg)
+            colored_fitness = float(colored_res.fitness)
+            colored_rmse = float(colored_res.inlier_rmse)
+            colored_eval = _evaluate_registration_transform(
+                src_pcd=src_pcd,
+                tgt_pcd=tgt_pcd,
+                T_candidate=T_colored,
+                after_depth_m=after_depth_m,
+                after_rgb=after_rgb,
+                after_mask=after_mask,
+                after_intr=after_intr,
+                cfg=cfg,
+            )
+            guard = _colored_icp_guard_decision(
+                T_gicp=T_gicp,
+                gicp_fitness=debug["gicp_fitness"],
+                gicp_rmse=debug["gicp_inlier_rmse"],
+                gicp_eval=gicp_eval,
+                T_colored=T_colored,
+                colored_fitness=colored_fitness,
+                colored_rmse=colored_rmse,
+                colored_eval=colored_eval,
+            )
+            debug["colored_icp_raw_fitness"] = colored_fitness
+            debug["colored_icp_raw_inlier_rmse"] = colored_rmse
+            debug["colored_icp_raw_visibility_score"] = float(colored_eval["visibility_score"])
+            debug["colored_icp_raw_projection_iou"] = float(colored_eval["projection_iou"])
+            debug["colored_icp_guard"] = guard
+            if guard["reject"]:
+                debug["colored_icp_rejected"] = True
+                debug["colored_icp_reject_reasons"] = list(guard["reasons"])
+                debug["colored_icp_effective_source"] = "gicp_fallback"
+                debug["colored_icp_fitness"] = debug["gicp_fitness"]
+                debug["colored_icp_inlier_rmse"] = debug["gicp_inlier_rmse"]
+            else:
+                T_final = T_colored
+                debug["colored_icp_rejected"] = False
+                debug["colored_icp_reject_reasons"] = []
+                debug["colored_icp_effective_source"] = "colored_icp"
+                debug["colored_icp_fitness"] = colored_fitness
+                debug["colored_icp_inlier_rmse"] = colored_rmse
+        except Exception as exc:
+            debug["colored_icp_error"] = str(exc).splitlines()[0]
+            debug["colored_icp_rejected"] = True
+            debug["colored_icp_reject_reasons"] = ["colored_icp_exception"]
+            debug["colored_icp_effective_source"] = "gicp_fallback"
+            debug["colored_icp_fitness"] = debug["gicp_fitness"]
+            debug["colored_icp_inlier_rmse"] = debug["gicp_inlier_rmse"]
+    debug["colored_icp_ms"] = int(round((time.perf_counter() - t_colored) * 1000.0))
+    debug["total_reg_ms"] = int(round((time.perf_counter() - t0) * 1000.0))
+    return T_final, debug
+
+
+def _registration_eval_metrics(src_pcd, tgt_pcd, T_candidate: np.ndarray, cfg: RegistrationConfig) -> dict[str, float]:
+    if o3d is None:
+        return {"fitness": 0.0, "rmse_m": math.inf}
+    try:
+        eval_res = o3d.pipelines.registration.evaluate_registration(
+            src_pcd,
+            tgt_pcd,
+            float(max(cfg.gicp_max_corr_dist, 1e-4)),
+            np.asarray(T_candidate, dtype=np.float64).reshape(4, 4),
+        )
+        return {
+            "fitness": float(getattr(eval_res, "fitness", 0.0)),
+            "rmse_m": float(getattr(eval_res, "inlier_rmse", math.inf)),
+        }
+    except Exception:
+        return {"fitness": 0.0, "rmse_m": math.inf}
+
+
+def _maybe_override_fallback_light_result(
+    candidate: SeedCandidate,
+    T_candidate: np.ndarray,
+    reg_debug: dict[str, Any],
+    visibility: dict[str, Any],
+    proj_metrics: dict[str, Any],
+    src_pcd,
+    tgt_pcd,
+    after: dict[str, Any],
+    cfg: RegistrationConfig,
+) -> tuple[np.ndarray, dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if str(candidate.search_mode or "") != "fallback_light":
+        return T_candidate, reg_debug, visibility, proj_metrics
+    metadata = candidate.metadata or {}
+    raw_iou = float(metadata.get("prefilter_projection_iou", 0.0))
+    raw_precision = float(metadata.get("prefilter_projection_precision", 0.0))
+    if raw_iou <= 1e-6 and raw_precision <= 1e-6:
+        return T_candidate, reg_debug, visibility, proj_metrics
+
+    current_iou = float(proj_metrics.get("projection_iou", 0.0))
+    current_precision = float(proj_metrics.get("projection_precision", 0.0))
+    iou_drop = raw_iou - current_iou
+    precision_drop = raw_precision - current_precision
+    current_rmse = float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf)))
+    collapse = bool(
+        (raw_iou >= 0.45 and current_iou + 0.18 < raw_iou and current_precision + 0.12 < raw_precision)
+        or (raw_iou >= 0.50 and current_iou < 0.25 and current_rmse >= 0.008)
+    )
+    if not collapse:
+        return T_candidate, reg_debug, visibility, proj_metrics
+
+    raw_T = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
+    raw_visibility = visibility_aware_score(
+        src_pcd_base=src_pcd,
+        tgt_pcd_base=tgt_pcd,
+        T_srcbase_to_tgtbase=raw_T,
+        wrist_depth=after["depth"],
+        wrist_rgb=after["rgb"],
+        wrist_intr=after["K"],
+        T_wrist_to_base=np.eye(4, dtype=np.float64),
+        cfg=cfg,
+    )
+    raw_proj_metrics = _projection_metrics(np.asarray(src_pcd.points, dtype=np.float64), raw_T, after["mask"], after["K"])
+    raw_eval = _registration_eval_metrics(src_pcd, tgt_pcd, raw_T, cfg)
+    updated_debug = dict(reg_debug)
+    updated_debug["fallback_light_override"] = {
+        "triggered": True,
+        "reason": "prefilter_projection_regression",
+        "raw_projection_iou": float(raw_iou),
+        "raw_projection_precision": float(raw_precision),
+        "refined_projection_iou": float(current_iou),
+        "refined_projection_precision": float(current_precision),
+        "iou_drop": float(iou_drop),
+        "precision_drop": float(precision_drop),
+    }
+    updated_debug["search_mode"] = "fallback_prefilter_keep"
+    updated_debug["colored_icp_effective_source"] = "fallback_prefilter_keep"
+    updated_debug["gicp_fitness"] = float(raw_eval["fitness"])
+    updated_debug["gicp_inlier_rmse"] = float(raw_eval["rmse_m"])
+    updated_debug["colored_icp_fitness"] = float(raw_eval["fitness"])
+    updated_debug["colored_icp_inlier_rmse"] = float(raw_eval["rmse_m"])
+    updated_debug["gicp_visibility_score"] = float(raw_visibility.get("score", 0.0))
+    updated_debug["gicp_projection_iou"] = float(raw_proj_metrics.get("projection_iou", 0.0))
+    updated_debug["colored_icp_rejected"] = True
+    updated_debug["colored_icp_reject_reasons"] = ["fallback_prefilter_keep"]
+    return raw_T, updated_debug, raw_visibility, raw_proj_metrics
+
+
+def assess_quality(
+    reg_fitness: float,
+    reg_rmse: float,
+    visibility_score: float,
+    projection_iou: float = 0.0,
+    projection_precision: float = 0.0,
+) -> dict[str, Any]:
+    quality = "good"
+    reasons: list[str] = []
+    strong_projection_support = bool(
+        projection_iou >= 0.45
+        and projection_precision >= 0.85
+        and visibility_score >= 0.45
+        and reg_fitness >= 0.95
+    )
+    if reg_fitness < 0.10:
+        quality = "poor"
+        reasons.append(f"low registration fitness ({reg_fitness:.3f})")
+    elif reg_fitness < 0.35:
+        quality = "fair"
+        reasons.append(f"moderate registration fitness ({reg_fitness:.3f})")
+
+    if not np.isfinite(reg_rmse) or reg_rmse > 0.030:
+        quality = "poor"
+        reasons.append(f"high registration RMSE ({reg_rmse:.4f}m)")
+    elif reg_rmse > 0.010 and quality != "poor" and not strong_projection_support:
+        quality = "fair"
+        reasons.append(f"moderate registration RMSE ({reg_rmse:.4f}m)")
+
+    if visibility_score < 0.05:
+        quality = "poor"
+        reasons.append(f"low visibility score ({visibility_score:.3f})")
+    elif visibility_score < 0.18 and quality != "poor":
+        quality = "fair"
+        reasons.append(f"moderate visibility score ({visibility_score:.3f})")
+    return {"quality": quality, "reasons": reasons}
+
+
+def run_reestimation(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    tapir_cfg: TapirMatchConfig,
+    cfg: RegistrationConfig | None = None,
+    log_fn=None,
+) -> ReEstimationResult:
+    if o3d is None:
+        raise RuntimeError("open3d is required")
+    cfg = cfg or RegistrationConfig()
+
+    t_total = time.perf_counter()
+    debug: dict[str, Any] = {
+        "mode": "camera",
+        "init_candidate_mode": "tapir",
+        "candidate_inits": [],
+        "best_init": "",
+        "tapir_init_enabled": True,
+    }
+    stage_timings: dict[str, float] = {}
+
+    t_stage = time.perf_counter()
+    _emit_runtime_log(log_fn, "pointcloud/before start")
+    before_pcd, before_downsample = _prepare_registration_pcd(before, cfg)
+    stage_timings["pointcloud / before"] = time.perf_counter() - t_stage
+    _emit_runtime_log(log_fn, f"pointcloud/before done {stage_timings['pointcloud / before'] * 1000.0:.1f} ms points={len(before_pcd.points)}")
+
+    t_stage = time.perf_counter()
+    _emit_runtime_log(log_fn, "pointcloud/after start")
+    after_pcd, after_downsample = _prepare_registration_pcd(after, cfg)
+    stage_timings["pointcloud / after"] = time.perf_counter() - t_stage
+    _emit_runtime_log(log_fn, f"pointcloud/after done {stage_timings['pointcloud / after'] * 1000.0:.1f} ms points={len(after_pcd.points)}")
+
+    debug["before_points"] = int(len(before_pcd.points))
+    debug["after_points"] = int(len(after_pcd.points))
+    debug["downsample_debug"] = {
+        "reference": before_downsample,
+        "current": after_downsample,
+    }
+
+    t_stage = time.perf_counter()
+    _emit_runtime_log(log_fn, "tapir/init start")
+    tapir_result = estimate_tapir_init_transform(
+        before_rgb=before["rgb"],
+        before_depth_m=before["depth"],
+        before_mask=before["mask"],
+        after_rgb=after["rgb"],
+        after_depth_m=after["depth"],
+        after_mask=after["mask"],
+        intr=before["K"],
+        cfg=tapir_cfg,
+    )
+    debug["tapir_init"] = tapir_result.debug
+    debug["_tapir_init_raw"] = tapir_result
+    stage_timings["tapir / init"] = time.perf_counter() - t_stage
+    tapir_debug = tapir_result.debug or {}
+    tapir_timings = tapir_debug.get("timings_s") or {}
+    track_e2e_s = float(tapir_timings.get("track", 0.0) or 0.0)
+    track_remote_roundtrip_s = float(tapir_timings.get("track_remote_roundtrip", track_e2e_s) or track_e2e_s)
+    stage_timings["tapir / init no_remote_roundtrip"] = max(
+        0.0,
+        float(stage_timings["tapir / init"]) - track_remote_roundtrip_s,
+    )
+    stage_timings["tapir / remote_roundtrip"] = max(
+        0.0,
+        float(stage_timings["tapir / init"]) - float(stage_timings["tapir / init no_remote_roundtrip"]),
+    )
+    track_no_rpc_io_s = float(tapir_timings.get("track_no_rpc_io", track_e2e_s) or track_e2e_s)
+    stage_timings["tapir / init no_rpc_io"] = max(
+        0.0,
+        float(stage_timings["tapir / init"]) - track_e2e_s + track_no_rpc_io_s,
+    )
+    stage_timings["tapir / rpc_io_overhead"] = max(
+        0.0,
+        float(stage_timings["tapir / init"]) - float(stage_timings["tapir / init no_rpc_io"]),
+    )
+    _emit_runtime_log(
+        log_fn,
+        f"tapir/init done {stage_timings['tapir / init'] * 1000.0:.1f} ms "
+        f"success={tapir_result.success} valid3d={(tapir_result.debug or {}).get('valid_3d_pairs', 0)} "
+        f"inliers={(tapir_result.debug or {}).get('inlier_count', 0)}",
+    )
+
+    seed_candidates, seed_debug = _build_seed_candidates(before, after, tapir_result, tapir_result.debug)
+    if not seed_candidates:
+        reason = tapir_result.debug.get("reason") or tapir_result.debug.get("error") or "no valid init seed"
+        raise RuntimeError(f"TAPIR init failed: {reason}")
+    debug["candidate_inits"] = [cand.tag for cand in seed_candidates]
+    debug["candidate_search_modes"] = [cand.search_mode for cand in seed_candidates]
+    debug["seed_policy"] = seed_debug.get("seed_policy")
+    _emit_runtime_log(
+        log_fn,
+        f"seed candidates prepared count={len(seed_candidates)} policy={seed_debug.get('seed_policy', '')} "
+        f"tags={debug['candidate_inits'][:8]}",
+    )
+
+    registration_before_pcd = before_pcd
+    registration_after_pcd = after_pcd
+    working_clouds_debug = {
+        "reference": {
+            "input_points": int(len(before_pcd.points)),
+            "used_points": int(len(before_pcd.points)),
+            "target_points": 0,
+            "applied": False,
+            "strategy": "identity",
+            "voxel_size_m": 0.0,
+            "random_subsample_applied": False,
+        },
+        "current": {
+            "input_points": int(len(after_pcd.points)),
+            "used_points": int(len(after_pcd.points)),
+            "target_points": 0,
+            "applied": False,
+            "strategy": "identity",
+            "voxel_size_m": 0.0,
+            "random_subsample_applied": False,
+        },
+    }
+    seed_policy = str(seed_debug.get("seed_policy") or "")
+    working_target_points = 0
+    if seed_policy == "tapir_prior_direct":
+        working_target_points = 0
+    elif seed_policy == "tapir_prior_compare":
+        working_target_points = 5000
+    elif seed_policy == "fallback_search":
+        working_target_points = 6000
+    if working_target_points > 0:
+        registration_before_pcd, working_clouds_debug["reference"] = _cap_registration_working_pcd(
+            before_pcd,
+            cfg=cfg,
+            max_points=int(working_target_points),
+            random_seed=17,
+        )
+        registration_after_pcd, working_clouds_debug["current"] = _cap_registration_working_pcd(
+            after_pcd,
+            cfg=cfg,
+            max_points=int(working_target_points),
+            random_seed=29,
+        )
+        _emit_runtime_log(
+            log_fn,
+            "registration working clouds "
+            f"ref={len(registration_before_pcd.points)}/{len(before_pcd.points)} "
+            f"cur={len(registration_after_pcd.points)}/{len(after_pcd.points)} "
+            f"target={working_target_points}",
+        )
+    debug["working_clouds_debug"] = working_clouds_debug
+    if seed_policy == "fallback_search":
+        seed_candidates, fallback_prefilter_debug = _prefilter_fallback_seed_candidates(
+            seed_candidates,
+            src_pcd=registration_before_pcd,
+            tgt_pcd=registration_after_pcd,
+            after=after,
+            intr=before["K"],
+            cfg=cfg,
+            keep_top_k=5,
+        )
+        seed_debug["fallback_prefilter"] = fallback_prefilter_debug
+        if bool(fallback_prefilter_debug.get("enabled")):
+            debug["candidate_inits"] = [cand.tag for cand in seed_candidates]
+            debug["candidate_search_modes"] = [cand.search_mode for cand in seed_candidates]
+            _emit_runtime_log(
+                log_fn,
+                "fallback prefilter "
+                f"kept={fallback_prefilter_debug.get('selected_candidate_count', 0)}/"
+                f"{fallback_prefilter_debug.get('input_candidate_count', 0)} "
+                f"tags={fallback_prefilter_debug.get('selected_tags', [])[:8]}",
+            )
+
+    best_result: dict[str, Any] | None = None
+    candidate_ranking: list[dict[str, Any]] = []
+    t_stage = time.perf_counter()
+    ref_proj_points = np.asarray(before_pcd.points, dtype=np.float64)
+    prior_result: dict[str, Any] | None = None
+    index = 0
+    while index < len(seed_candidates):
+        candidate = seed_candidates[index]
+        t_candidate = time.perf_counter()
+        _emit_runtime_log(log_fn, f"seed[{index}] start tag={candidate.tag}")
+        if str(candidate.search_mode or "") == "tapir_prior_keep":
+            T_candidate = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
+            reg_debug = _tapir_prior_keep_debug(candidate)
+        else:
+            T_candidate, reg_debug = coarse_fine_registration(
+                src_pcd=registration_before_pcd,
+                tgt_pcd=registration_after_pcd,
+                T_init=np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4),
+                after_depth_m=after["depth"],
+                after_rgb=after["rgb"],
+                after_mask=after["mask"],
+                after_intr=before["K"],
+                cfg=cfg,
+                search_mode=str(candidate.search_mode or "full"),
+        )
+        visibility = visibility_aware_score(
+            src_pcd_base=registration_before_pcd,
+            tgt_pcd_base=registration_after_pcd,
+            T_srcbase_to_tgtbase=T_candidate,
+            wrist_depth=after["depth"],
+            wrist_rgb=after["rgb"],
+            wrist_intr=before["K"],
+            T_wrist_to_base=np.eye(4, dtype=np.float64),
+            cfg=cfg,
+        )
+        proj_metrics = _projection_metrics(ref_proj_points, T_candidate, after["mask"], before["K"])
+        T_candidate, reg_debug, visibility, proj_metrics = _maybe_override_fallback_light_result(
+            candidate=candidate,
+            T_candidate=T_candidate,
+            reg_debug=reg_debug,
+            visibility=visibility,
+            proj_metrics=proj_metrics,
+            src_pcd=registration_before_pcd,
+            tgt_pcd=registration_after_pcd,
+            after=after,
+            cfg=cfg,
+        )
+        selection_score_raw, selection_meta = _selection_score(reg_debug, proj_metrics)
+        selection_bias = 0.05 * float(candidate.score_hint)
+        selection_score = float(selection_score_raw + selection_bias)
+        candidate_info = {
+            "index": index,
+            "tag": candidate.tag,
+            "selection_score": float(selection_score),
+            "selection_score_raw": float(selection_score_raw),
+            "selection_bias": float(selection_bias),
+            "visibility_score": float(visibility.get("score", 0.0)),
+            "projection_iou": float(proj_metrics.get("projection_iou", 0.0)),
+            "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
+            "rmse_m": float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
+            "gicp_fitness": float(reg_debug.get("gicp_fitness", 0.0)),
+            "metadata": candidate.metadata,
+            "search_mode": str(candidate.search_mode or "full"),
+        }
+        candidate_ranking.append(candidate_info)
+        _emit_runtime_log(
+            log_fn,
+            f"seed[{index}] done tag={candidate.tag} total={(time.perf_counter() - t_candidate) * 1000.0:.1f} ms "
+            f"score={selection_score:.4f} rmse={candidate_info['rmse_m']:.4f} "
+            f"proj_iou={candidate_info['projection_iou']:.3f} vis={candidate_info['visibility_score']:.3f}",
+        )
+        if str(candidate.tag) == "tapir_prior_keep":
+            prior_result = {
+                "candidate": candidate,
+                "candidate_index": index,
+                "T_registration": T_candidate,
+                "reg_debug": dict(reg_debug),
+                "visibility": dict(visibility),
+                "proj_metrics": dict(proj_metrics),
+                "selection_score": float(selection_score),
+                "selection_meta": dict(selection_meta),
+            }
+        score_key = (
+            float(selection_score),
+            -float(visibility.get("score", 0.0)),
+            float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
+            -float(proj_metrics.get("projection_precision", 0.0)),
+            -float(proj_metrics.get("projection_iou", 0.0)),
+        )
+        if best_result is None or score_key < best_result["score_key"]:
+            best_result = {
+                "candidate": candidate,
+                "candidate_index": index,
+                "T_registration": T_candidate,
+                "reg_debug": reg_debug,
+                "visibility": visibility,
+                "proj_metrics": proj_metrics,
+                "selection_score": float(selection_score),
+                "selection_meta": selection_meta,
+                "score_key": score_key,
+            }
+        index += 1
+    if seed_policy == "tapir_prior_compare":
+        keep_prior, prior_compare_debug = _prior_compare_keep_decision(best_result, prior_result)
+        seed_debug["prior_compare"] = prior_compare_debug
+        if keep_prior and prior_result is not None:
+            best_result = prior_result
+            _emit_runtime_log(
+                log_fn,
+                "prior-compare keep prior "
+                f"reason={prior_compare_debug.get('reason', '')} "
+                f"iou_gain={float(prior_compare_debug.get('iou_gain', 0.0)):.3f} "
+                f"rmse_drop={float(prior_compare_debug.get('rmse_drop_m', 0.0)):.4f}",
+            )
+    stage_timings["registration / refine"] = time.perf_counter() - t_stage
+    _emit_runtime_log(log_fn, f"registration/refine done {stage_timings['registration / refine'] * 1000.0:.1f} ms")
+
+    assert best_result is not None
+    T_registration = np.asarray(best_result["T_registration"], dtype=np.float64).reshape(4, 4)
+    reg_debug = dict(best_result["reg_debug"])
+    visibility = dict(best_result["visibility"])
+    proj_metrics = dict(best_result["proj_metrics"])
+    debug.update({f"reg_{key}": value for key, value in reg_debug.items()})
+    debug["reg_visibility_score"] = float(visibility.get("score", 0.0))
+    debug["reg_visible_count"] = int(round(float(visibility.get("visible_count", 0.0))))
+    debug["reg_depth_ok_ratio"] = float(visibility.get("depth_ok_ratio", 0.0))
+    debug["reg_projection_precision"] = float(proj_metrics.get("projection_precision", 0.0))
+    debug["reg_projection_iou"] = float(proj_metrics.get("projection_iou", 0.0))
+    debug["best_init"] = str(best_result["candidate"].tag)
+    debug["best_score"] = float(best_result["selection_score"])
+    debug["candidate_ranking"] = sorted(candidate_ranking, key=lambda item: item["selection_score"])[:5]
+    debug["selection_score"] = float(best_result["selection_score"])
+    debug["selection_meta"] = dict(best_result["selection_meta"])
+    debug["registration_summary"] = {
+        "transform_ref_to_cur": T_registration.tolist(),
+        "transform_cur_to_ref": _rigid_inverse(T_registration).tolist(),
+        "fitness": float(reg_debug.get("colored_icp_fitness", reg_debug.get("gicp_fitness", 0.0))),
+        "rmse_m": float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
+        "coarse_score": float(reg_debug.get("coarse_score", -1e9)),
+        "candidate_index": (-2 if best_result["candidate"].tag == "tapir_prior_local_refine" else int(best_result["candidate_index"])),
+        "candidate_count": int(len(seed_candidates)),
+        "rotation_change_deg": _rotation_angle_deg(T_registration[:3, :3]),
+        "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
+        "projection_iou": float(proj_metrics.get("projection_iou", 0.0)),
+        "search_mode": str(reg_debug.get("search_mode", "")),
+        "coarse_ms": int(reg_debug.get("coarse_ms", 0) or 0),
+        "fine_ms": int(reg_debug.get("fine_ms", 0) or 0),
+        "gicp_ms": int(reg_debug.get("gicp_ms", 0) or 0),
+        "colored_icp_ms": int(reg_debug.get("colored_icp_ms", 0) or 0),
+        "total_reg_ms": int(reg_debug.get("total_reg_ms", 0) or 0),
+        "colored_icp_effective_source": str(reg_debug.get("colored_icp_effective_source", "")),
+        "selection_score": float(best_result["selection_score"]),
+        "surface_reference_points": int(len(registration_before_pcd.points)),
+        "surface_current_points": int(len(registration_after_pcd.points)),
+        "seed_debug": {
+            **seed_debug,
+            "selected_candidate_tag": str(best_result["candidate"].tag),
+            "selected_candidate_augmented": bool(best_result["candidate"].metadata.get("extra_angle_deg") is not None),
+            "selected_candidate_extra_angle_deg": best_result["candidate"].metadata.get("extra_angle_deg"),
+            "chosen_seed_index": int(best_result["candidate_index"]),
+            "chosen_seed_tag": str(best_result["candidate"].tag),
+            "chosen_seed_augmented": bool(best_result["candidate"].metadata.get("extra_angle_deg") is not None),
+            "chosen_seed_extra_angle_deg": best_result["candidate"].metadata.get("extra_angle_deg"),
+            "candidate_ranking_topk": sorted(candidate_ranking, key=lambda item: item["selection_score"])[:5],
+            "tapir_prior": {
+                **(tapir_result.debug or {}),
+                **best_result["selection_meta"],
+            },
+        },
+        "downsample_debug": {
+            "reference": before_downsample,
+            "current": after_downsample,
+        },
+        "working_clouds_debug": working_clouds_debug,
+    }
+
+    quality = assess_quality(
+        float(reg_debug.get("colored_icp_fitness", reg_debug.get("gicp_fitness", 0.0))),
+        float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
+        float(visibility.get("score", 0.0)),
+        float(proj_metrics.get("projection_iou", 0.0)),
+        float(proj_metrics.get("projection_precision", 0.0)),
+    )
+    debug["quality"] = quality
+    debug["stage_timings_s"] = stage_timings
+    elapsed_s = time.perf_counter() - t_total
+    debug["total_elapsed_s"] = elapsed_s
+    _emit_runtime_log(
+        log_fn,
+        f"run done total={elapsed_s * 1000.0:.1f} ms best_init={debug['best_init']} "
+        f"quality={quality['quality']} reg_rmse={debug.get('reg_colored_icp_inlier_rmse', debug.get('reg_gicp_inlier_rmse'))}",
+    )
+
+    return ReEstimationResult(
+        success=quality["quality"] != "poor",
+        mode="camera",
+        T_registration=T_registration,
+        T_slip=T_registration.copy(),
+        debug=debug,
+        elapsed_s=elapsed_s,
+    )
+
+
+def _parse_replay_dir_name(replay_dir_name: str) -> str:
+    parts = replay_dir_name.split("_")
+    if len(parts) >= 2:
+        return parts[1][:6]
+    return replay_dir_name[:20]
+
+
+def _result_row(pair: dict[str, Any], save_dir: Path | None = None) -> dict[str, Any]:
     before_dir = pair.get("before_dir")
     replay_dir = pair.get("replay_dir")
     log_root = pair.get("log_root")
     return {
+        "case_name": _parse_replay_dir_name(replay_dir.name if isinstance(replay_dir, Path) else ""),
         "ok": False,
         "error": "",
         "log_root": str(log_root) if log_root else "",
@@ -6066,256 +2005,274 @@ def _dof_result_row(pair: dict[str, Any], save_dir: Path | None = None) -> dict[
         "memory_dir": pair.get("memory_dir", ""),
         "before_id": before_dir.name if isinstance(before_dir, Path) else "",
         "replay_id": replay_dir.name if isinstance(replay_dir, Path) else "",
+        "init_method": "tapir",
         "save_dir": str(save_dir) if save_dir else "",
     }
 
 
-def _fill_dof_metrics(row: dict[str, Any], result: ReEstimationResult) -> None:
+def _case_output_dirname(pair: dict[str, Any], seen_names: set[str] | None = None) -> str:
+    replay_dir = pair.get("replay_dir")
+    log_root = pair.get("log_root")
+    if not isinstance(replay_dir, Path):
+        return "unknown_case"
+    base_name = _parse_replay_dir_name(replay_dir.name)
+    if seen_names is None:
+        return base_name
+    if base_name not in seen_names:
+        seen_names.add(base_name)
+        return base_name
+    log_name = log_root.name if isinstance(log_root, Path) else "log"
+    candidate = f"{log_name}__{base_name}"
+    suffix = 2
+    while candidate in seen_names:
+        candidate = f"{log_name}__{base_name}__{suffix}"
+        suffix += 1
+    seen_names.add(candidate)
+    return candidate
+
+
+def _fill_result_row(row: dict[str, Any], result: ReEstimationResult) -> None:
     debug = result.debug or {}
-    quality = debug.get("quality", {}) or {}
-    lightglue = debug.get("lightglue_init", {}) or {}
     tapir = debug.get("tapir_init", {}) or {}
-    row.update({
-        "ok": True,
-        "quality": quality.get("quality", ""),
-        "mode": result.mode,
-        "init_candidate_mode": debug.get("init_candidate_mode"),
-        "candidate_inits": ",".join(str(v) for v in (debug.get("candidate_inits") or [])),
-        "elapsed_s": result.elapsed_s,
-        "best_init": debug.get("best_init"),
-        "best_score": debug.get("best_score"),
-        "gicp_fitness": debug.get("reg_gicp_fitness"),
-        "gicp_rmse_m": debug.get("reg_gicp_inlier_rmse"),
-        "colored_icp_fitness": debug.get("reg_colored_icp_fitness"),
-        "colored_icp_rmse_m": debug.get("reg_colored_icp_inlier_rmse"),
-        "silhouette_f1": debug.get("reg_silhouette_f1"),
-        "silhouette_iou": debug.get("reg_silhouette_iou"),
-        "cloud_overlap_f1": debug.get("reg_cloud_overlap_f1"),
-        "cloud_overlap_chamfer_m": debug.get("reg_cloud_overlap_chamfer_m"),
-        "shape_weight": debug.get("reg_shape_weight"),
-        "shape_score": debug.get("reg_shape_score"),
-        "lightglue_enabled": lightglue.get("enabled"),
-        "lightglue_success": lightglue.get("success"),
-        "lightglue_candidate_added": lightglue.get("candidate_added"),
-        "lightglue_matches": lightglue.get("num_matches"),
-        "lightglue_valid3d": lightglue.get("num_valid_3d_matches"),
-        "lightglue_inliers": lightglue.get("num_inliers"),
-        "lightglue_inlier_ratio": lightglue.get("inlier_ratio"),
-        "lightglue_rmse_m": lightglue.get("ransac_rmse_m"),
-        "tapir_enabled": tapir.get("enabled"),
-        "tapir_success": tapir.get("success"),
-        "tapir_candidate_added": tapir.get("candidate_added"),
-        "tapir_matches": tapir.get("num_matches"),
-        "tapir_valid3d": tapir.get("num_valid_3d_matches"),
-        "tapir_inliers": tapir.get("num_inliers"),
-        "tapir_inlier_ratio": tapir.get("inlier_ratio"),
-        "tapir_rmse_m": tapir.get("ransac_rmse_m"),
-    })
-
-
-def _candidate_metric_table_rows(debug: dict[str, Any] | None) -> list[dict[str, Any]]:
-    rows = (debug or {}).get("init_diagnostics") or []
-    metric_fields = [
-        "combined_score",
-        "visibility_score",
-        "silhouette_f1",
-        "silhouette_iou",
-        "silhouette_precision",
-        "silhouette_recall",
-        "cloud_overlap_f1",
-        "cloud_overlap_chamfer_m",
-        "shape_score",
-        "gicp_fitness",
-        "gicp_inlier_rmse_m",
-        "colored_icp_fitness",
-        "colored_icp_inlier_rmse_m",
-    ]
-    out: list[dict[str, Any]] = []
-    for rank, row in enumerate(rows, start=1):
-        item: dict[str, Any] = {
-            "rank": rank,
-            "candidate": _display_init_name(row.get("name", "")),
+    quality = debug.get("quality", {}) or {}
+    row.update(
+        {
+            "ok": True,
+            "quality": quality.get("quality", ""),
+            "elapsed_s": result.elapsed_s,
+            "best_init": debug.get("best_init", "tapir"),
+            "best_score": debug.get("best_score"),
+            "tapir_success": tapir.get("success"),
+            "tapir_backend": tapir.get("backend"),
+            "tapir_remote_host": tapir.get("remote_host"),
+            "tapir_remote_port": tapir.get("remote_port"),
+            "tapir_matches": tapir.get("num_matches"),
+            "tapir_valid3d": tapir.get("num_valid_3d_matches"),
+            "tapir_inliers": tapir.get("num_inliers"),
+            "tapir_inlier_ratio": tapir.get("inlier_ratio"),
+            "tapir_rmse_m": tapir.get("ransac_rmse_m"),
+            "tapir_track_e2e_ms": tapir.get("tapir_latency_ms"),
+            "tapir_track_no_remote_roundtrip_ms": tapir.get("tapir_latency_no_remote_roundtrip_ms"),
+            "tapir_track_no_rpc_io_ms": tapir.get("tapir_latency_no_rpc_io_ms"),
+            "tapir_init_e2e_ms": tapir.get("tapir_init_latency_ms"),
+            "tapir_init_no_remote_roundtrip_ms": tapir.get("tapir_init_latency_no_remote_roundtrip_ms"),
+            "tapir_init_no_rpc_io_ms": tapir.get("tapir_init_latency_no_rpc_io_ms"),
+            "visibility_score": debug.get("reg_visibility_score"),
+            "visible_count": debug.get("reg_visible_count"),
+            "depth_ok_ratio": debug.get("reg_depth_ok_ratio"),
+            "gicp_fitness": debug.get("reg_gicp_fitness"),
+            "gicp_rmse_m": debug.get("reg_gicp_inlier_rmse"),
+            "colored_icp_fitness": debug.get("reg_colored_icp_fitness"),
+            "colored_icp_rmse_m": debug.get("reg_colored_icp_inlier_rmse"),
         }
-        for field in metric_fields:
-            item[field] = row.get(field)
-        out.append(_sanitize_init_names_for_output(item))
-    return out
+    )
 
 
-def _compact_result_method_payload(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        return {"candidate_metrics": []}
-    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
-    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
-    candidate_metrics = payload.get("candidate_metrics")
-    if not isinstance(candidate_metrics, list):
-        candidate_metrics = _candidate_metric_table_rows({
-            "init_diagnostics": (
-                diagnostics.get("init_diagnostics")
-                or payload.get("init_diagnostics")
-                or []
-            )
-        })
-    return _sanitize_init_names_for_output({
-        "success": payload.get("success"),
-        "quality": payload.get("quality") if not isinstance(payload.get("quality"), dict) else payload.get("quality", {}).get("quality", ""),
-        "elapsed_s": payload.get("elapsed_s"),
-        "best_init": payload.get("best_init", metrics.get("best_init")),
-        "best_score": payload.get("best_score", metrics.get("best_score")),
-        "candidate_metrics": candidate_metrics,
-    })
-
-
-def _write_dof_pair_outputs(
+def _write_pair_outputs(
     save_dir: Path,
+    pair: dict[str, Any],
     before: dict[str, Any],
     after: dict[str, Any],
     result: ReEstimationResult,
     cfg_used: RegistrationConfig,
-    pair: dict[str, Any],
-    export_artifacts: bool,
 ) -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
-    stale_error = save_dir / "error.txt"
-    if stale_error.exists():
-        stale_error.unlink()
-    legacy_feature_overlay = save_dir / "feature_matches_overlay.png"
-    lightglue_overlay = save_dir / "lightglue_matches_overlay.png"
-    if legacy_feature_overlay.exists() and not lightglue_overlay.exists():
-        legacy_feature_overlay.rename(lightglue_overlay)
-    for old_name in (
-        "key_metrics_summary.txt",
-        "input_manifest.json",
-        "feature_match_diagnostics.json",
-        "lightglue_match_diagnostics.json",
-        "tapir_match_diagnostics.json",
+    for stale_name in (
+        "error.txt",
+        "tapir_error.txt",
+        "tapir.ply",
+        "tapir_overlay.png",
+        "tapir_matches_overlay.png",
+        "left_replay_object_overlay.png",
     ):
-        old_path = save_dir / old_name
-        if old_path.exists():
-            old_path.unlink()
+        stale_path = save_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
+    for stale_pattern in (
+        "left_replay_object_overlay_no_trim_tapir_*.png",
+        "tapir_correspondence_overlay_*.png",
+        "left_replay_object_tapir_prior_overlay_*.png",
+    ):
+        for stale_path in save_dir.glob(stale_pattern):
+            if stale_path.is_file():
+                stale_path.unlink()
 
-    debug = result.debug or {}
-    init_method = _display_init_name(debug.get("init_candidate_mode") or "auto")
-    current_error = save_dir / f"{_safe_artifact_stem(init_method)}_error.txt"
-    if current_error.exists():
-        current_error.unlink()
-    case_payload = {
-        "case_name": _parse_replay_dir_name(pair["replay_dir"].name),
-        "before_id": pair["before_dir"].name,
-        "replay_id": pair["replay_dir"].name,
-        "memory_dir": pair.get("memory_dir", ""),
-    }
-    run_payload = {
-        "success": result.success,
-        "quality": (debug.get("quality") or {}).get("quality", ""),
-        "elapsed_s": result.elapsed_s,
-        "best_init": debug.get("best_init"),
-        "best_score": debug.get("best_score"),
-        "candidate_metrics": _candidate_metric_table_rows(debug),
-    }
-    result_path = save_dir / "result.json"
-    result_payload: dict[str, Any] = {
-        "case": case_payload,
-        "results_by_init_method": {},
-    }
-    if result_path.exists():
-        try:
-            existing = _sanitize_init_names_for_output(_read_json_file(result_path))
-            if isinstance(existing.get("results_by_init_method"), dict):
-                result_payload["results_by_init_method"] = {
-                    str(_display_init_name(method)): _compact_result_method_payload(payload)
-                    for method, payload in existing.get("results_by_init_method", {}).items()
-                }
-            elif isinstance(existing, dict) and existing:
-                old_method = (
-                    existing.get("latest_init_method")
-                    or (existing.get("metrics") or {}).get("init_candidate_mode")
-                    or existing.get("init_candidate_mode")
-                    or (existing.get("metrics") or {}).get("best_init")
-                    or "unknown"
-                )
-                result_payload["results_by_init_method"] = {
-                    str(_display_init_name(old_method)): _compact_result_method_payload(existing)
-                }
-        except Exception:
-            result_payload = {
-                "case": case_payload,
-                "results_by_init_method": {},
-            }
-    result_payload["case"] = case_payload
-    results_by_method = result_payload.setdefault("results_by_init_method", {})
-    if not isinstance(results_by_method, dict):
-        results_by_method = {}
-        result_payload["results_by_init_method"] = results_by_method
-    results_by_method[str(init_method)] = run_payload
-    result_payload["latest_init_method"] = str(init_method)
-    result_payload["latest"] = run_payload
-    result_payload["available_init_methods"] = sorted(str(k) for k in results_by_method.keys())
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(_sanitize_init_names_for_output(result_payload), f, indent=2, default=str)
-
-    if not export_artifacts:
-        return
-
-    bp = preprocess_pcd(rgbd_to_pointcloud(before["rgb"], before["depth"], before["mask"], before["K"], cfg_used), cfg_used)
-    ap = preprocess_pcd(rgbd_to_pointcloud(after["rgb"], after["depth"], after["mask"], after["K"], cfg_used), cfg_used)
+    bp, before_downsample = _prepare_registration_pcd(before, cfg_used)
+    ap, after_downsample = _prepare_registration_pcd(after, cfg_used)
     aligned = copy_pcd(bp)
     aligned.transform(result.T_registration)
-    
-    o3d.io.write_point_cloud(str(save_dir / "object_before.ply"), bp)
-    o3d.io.write_point_cloud(str(save_dir / "object_after.ply"), ap)
-    o3d.io.write_point_cloud(str(save_dir / "object_before_aligned.ply"), aligned)
-    
-    reg2d_vis = _draw_registration_overlay_2d(after["rgb"], after["mask"], after["depth"], after["K"], ap, aligned)
-    cv2.imwrite(str(save_dir / "_overlay_tmp.png"), cv2.cvtColor(reg2d_vis, cv2.COLOR_RGB2BGR))
-    lightglue_raw = result.debug.get("_lightglue_init_raw")
-    if lightglue_raw is not None:
-        lightglue_vis = draw_lightglue_matches(before["rgb"], after["rgb"], lightglue_raw)
-        cv2.imwrite(str(save_dir / "lightglue_matches_overlay.png"), cv2.cvtColor(lightglue_vis, cv2.COLOR_RGB2BGR))
+
+    o3d.io.write_point_cloud(str(save_dir / "before.ply"), bp)
+    o3d.io.write_point_cloud(str(save_dir / "after.ply"), ap)
+    o3d.io.write_point_cloud(str(save_dir / "reference_object_transformed_colored.ply"), aligned)
+
+    overlay = _draw_registration_overlay(after["rgb"], after["mask"], aligned, after["K"])
+    cv2.imwrite(str(save_dir / "left_replay_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
     tapir_raw = result.debug.get("_tapir_init_raw")
     if tapir_raw is not None:
-        tapir_vis = draw_tapir_matches(before["rgb"], after["rgb"], tapir_raw)
-        cv2.imwrite(str(save_dir / "tapir_matches_overlay.png"), cv2.cvtColor(tapir_vis, cv2.COLOR_RGB2BGR))
-    
-    _rename_result_artifacts(save_dir, str(init_method))
+        tapir_match_vis = draw_tapir_matches(before["rgb"], after["rgb"], tapir_raw)
+        requested_points = int(((result.debug.get("tapir_init") or {}).get("requested_points")) or 0)
+        mode = str(((result.debug.get("tapir_init") or {}).get("sampling_mode")) or "uniform_random")
+        if requested_points > 0:
+            cv2.imwrite(
+                str(save_dir / f"tapir_correspondence_overlay_{mode}_{requested_points}.png"),
+                cv2.cvtColor(tapir_match_vis, cv2.COLOR_RGB2BGR),
+            )
+        tapir_T = _reconstruct_tapir_transform(tapir_raw)
+        if tapir_T is not None:
+            tapir_aligned = copy_pcd(bp)
+            tapir_aligned.transform(tapir_T)
+            tapir_overlay = _draw_registration_overlay(after["rgb"], after["mask"], tapir_aligned, after["K"])
+            if requested_points > 0:
+                cv2.imwrite(
+                    str(save_dir / f"left_replay_object_tapir_prior_overlay_{mode}_{requested_points}.png"),
+                    cv2.cvtColor(tapir_overlay, cv2.COLOR_RGB2BGR),
+                )
+
+    ref_mask = np.asarray(before["mask"]) > 0
+    ys, xs = np.nonzero(ref_mask)
+    if len(xs):
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        object_crop = before["rgb"][y0:y1, x0:x1]
+    else:
+        object_crop = before["rgb"]
+    cv2.imwrite(str(save_dir / "memory_reference_left.png"), cv2.cvtColor(before["rgb"], cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(save_dir / "memory_reference_object.png"), cv2.cvtColor(object_crop, cv2.COLOR_RGB2BGR))
+
+    registration_summary = dict(result.debug.get("registration_summary") or {})
+    registration_summary.setdefault("downsample_debug", {"reference": before_downsample, "current": after_downsample})
+    with open(save_dir / "registration.json", "w", encoding="utf-8") as handle:
+        json.dump(registration_summary, handle, indent=2, default=str)
+
+    tapir_prior_payload = dict(result.debug.get("tapir_init") or {})
+    tapir_prior_payload["request_id"] = after.get("request", {}).get("request_id") or pair["replay_dir"].name
+    tapir_prior_payload["applied"] = _reconstruct_tapir_transform(tapir_raw) is not None
+    tapir_prior_payload["ransac"] = {
+        "ok": bool(tapir_prior_payload.get("ransac_success", False)),
+        "reason": tapir_prior_payload.get("reason", "ok" if tapir_prior_payload.get("success") else ""),
+        "iters": int(tapir_prior_payload.get("ransac_num_hypotheses", 0) or 0),
+        "sample_size": 4,
+        "threshold_m": float(tapir_prior_payload.get("ransac_thresh_m", tapir_prior_payload.get("rmse_m", 0.0)) or 0.0),
+    }
+    with open(save_dir / "tapir_prior_debug.json", "w", encoding="utf-8") as handle:
+        json.dump(tapir_prior_payload, handle, indent=2, default=str)
+
+    memory_reference_payload = {
+        "memory_dir": pair.get("memory_dir", ""),
+        "request_id": before.get("request", {}).get("request_id") or before["artifact_dir"].name,
+        "reference_points": int(before.get("object_points", 0) or len(np.asarray(before.get("object_xyz", [])))),
+        "gripper_variant_names": [
+            str(item.get("name"))
+            for item in ((before.get("response", {}).get("gripper", {}) or {}).get("variants") or [])
+            if isinstance(item, dict) and item.get("name")
+        ],
+        "experiment_config": after.get("experiment_config", {}) or {},
+    }
+    with open(save_dir / "memory_reference.json", "w", encoding="utf-8") as handle:
+        json.dump(memory_reference_payload, handle, indent=2, default=str)
+
+    result_payload = {
+        "case": {
+            "case_name": _parse_replay_dir_name(pair["replay_dir"].name),
+            "before_id": pair["before_dir"].name,
+            "replay_id": pair["replay_dir"].name,
+            "memory_dir": pair.get("memory_dir", ""),
+        },
+        "success": result.success,
+        "quality": (result.debug.get("quality") or {}).get("quality", ""),
+        "elapsed_s": result.elapsed_s,
+        "init_method": "tapir",
+        "T_registration": np.asarray(result.T_registration, dtype=np.float64).tolist(),
+        "T_slip": np.asarray(result.T_slip, dtype=np.float64).tolist(),
+        "metrics": {
+            "best_init": result.debug.get("best_init"),
+            "best_score": result.debug.get("best_score"),
+            "gicp_fitness": result.debug.get("reg_gicp_fitness"),
+            "gicp_rmse_m": result.debug.get("reg_gicp_inlier_rmse"),
+            "colored_icp_fitness": result.debug.get("reg_colored_icp_fitness"),
+            "colored_icp_rmse_m": result.debug.get("reg_colored_icp_inlier_rmse"),
+            "visibility_score": result.debug.get("reg_visibility_score"),
+            "visible_count": result.debug.get("reg_visible_count"),
+            "depth_ok_ratio": result.debug.get("reg_depth_ok_ratio"),
+        },
+        "tapir_init": result.debug.get("tapir_init"),
+        "registration": result.debug.get("registration_summary"),
+        "stage_timings_s": result.debug.get("stage_timings_s"),
+    }
+    with open(save_dir / "result.json", "w", encoding="utf-8") as handle:
+        json.dump(result_payload, handle, indent=2, default=str)
+
+    response_payload = {
+        "ok": bool(result.success),
+        "request_id": after.get("request", {}).get("request_id") or pair["replay_dir"].name,
+        "artifacts_dir": str(save_dir),
+        "memory_dir": pair.get("memory_dir", ""),
+        "experiment_config": after.get("experiment_config", {}) or {},
+        "timings_ms": {
+            "total": int(round(float(result.elapsed_s) * 1000.0)),
+            "tapir": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
+            "tapir_no_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
+            "tapir_e2e": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init", 0.0)) * 1000.0))),
+            "tapir_no_rpc_io": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_rpc_io", 0.0)) * 1000.0))),
+        },
+        "selected_variant": (after.get("selected_replay_pose", {}) or {}).get("variant_name"),
+        "overlay_path": str(save_dir / "left_replay_overlay.png"),
+        "registration": result.debug.get("registration_summary"),
+        "timings_detail_ms": {
+            "service": {
+                "tapir_prior": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
+                "tapir_prior_no_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
+                "tapir_prior_e2e": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init", 0.0)) * 1000.0))),
+                "tapir_prior_no_rpc_io": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_rpc_io", 0.0)) * 1000.0))),
+                "tapir_prior_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / remote_roundtrip", 0.0)) * 1000.0))),
+                "tapir_prior_rpc_io_overhead": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / rpc_io_overhead", 0.0)) * 1000.0))),
+                "registration": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / refine", 0.0)) * 1000.0))),
+                "total": int(round(float(result.elapsed_s) * 1000.0)),
+            }
+        },
+    }
+    with open(save_dir / "response.json", "w", encoding="utf-8") as handle:
+        json.dump(response_payload, handle, indent=2, default=str)
 
 
-def _rename_result_artifacts(save_dir: Path, init_method: str) -> None:
-    """Rename result artifacts based on init_method
-    PLY files: before.ply, after.ply, {init_method}.ply
-    Overlay: {init_method}_overlay.png
-    """
-    save_dir = Path(save_dir)
-    
-    # Rename PLY files
-    old_before = save_dir / "object_before.ply"
-    new_before = save_dir / "before.ply"
-    if old_before.exists():
-        if new_before.exists():
-            new_before.unlink()
-        old_before.rename(new_before)
-    
-    old_after = save_dir / "object_after.ply"
-    new_after = save_dir / "after.ply"
-    if old_after.exists():
-        if new_after.exists():
-            new_after.unlink()
-        old_after.rename(new_after)
-    
-    old_aligned = save_dir / "object_before_aligned.ply"
-    new_aligned = save_dir / f"{init_method}.ply"
-    if old_aligned.exists():
-        if new_aligned.exists():
-            new_aligned.unlink()
-        old_aligned.rename(new_aligned)
-    
-    # Rename overlay image
-    old_overlay = save_dir / "_overlay_tmp.png"
-    new_overlay = save_dir / f"{init_method}_overlay.png"
-    if old_overlay.exists():
-        if new_overlay.exists():
-            new_overlay.unlink()
-        old_overlay.rename(new_overlay)
+def _merge_tapir_cfg(base_cfg: TapirMatchConfig, replay_sample: dict[str, Any]) -> TapirMatchConfig:
+    exp = replay_sample.get("experiment_config", {}) or {}
+    if not isinstance(exp, dict) or not exp:
+        return base_cfg
+    dense_eval_max_points = base_cfg.dense_eval_max_points
+    projection_eval_downsample = base_cfg.projection_eval_downsample
+    dense_eval_raw = exp.get("tapir_dense_eval_max_points")
+    proj_downsample_raw = exp.get("tapir_projection_eval_downsample")
+    if dense_eval_raw is not None:
+        try:
+            dense_eval_max_points = int(dense_eval_raw)
+        except Exception:
+            dense_eval_max_points = base_cfg.dense_eval_max_points
+    if proj_downsample_raw is not None:
+        try:
+            projection_eval_downsample = max(1, int(proj_downsample_raw))
+        except Exception:
+            projection_eval_downsample = base_cfg.projection_eval_downsample
+    return replace(
+        base_cfg,
+        requested_points=int(exp.get("tapir_num_points", base_cfg.requested_points) or base_cfg.requested_points),
+        max_query_points=int(exp.get("tapir_num_points", base_cfg.max_query_points) or base_cfg.max_query_points),
+        random_seed=int(exp.get("tapir_random_seed", base_cfg.random_seed) or base_cfg.random_seed),
+        prior_confidence_accept_thresh=float(
+            exp.get("tapir_local_prior_confidence_accept_thresh", base_cfg.prior_confidence_accept_thresh)
+        ),
+        prior_confidence_strong_thresh=float(
+            exp.get("tapir_local_prior_confidence_strong_thresh", base_cfg.prior_confidence_strong_thresh)
+        ),
+        dense_eval_max_points=int(dense_eval_max_points),
+        projection_eval_downsample=int(projection_eval_downsample),
+    )
+
+
+def _merge_registration_cfg(base_cfg: RegistrationConfig, replay_sample: dict[str, Any]) -> RegistrationConfig:
+    return base_cfg
 
 
 def run_dof_cached_pair(
@@ -6324,17 +2281,14 @@ def run_dof_cached_pair(
     save_dir: str | os.PathLike[str],
     memory_dir: str = "",
     voxel_size: float = 0.003,
-    use_coarse_fine: bool = True,
-    enable_pcd_fit: bool = True,
-    enable_lightglue_init: bool = True,
-    enable_tapir_init: bool = True,
-    init_candidate_mode: str = "auto",
     tapir_cfg: TapirMatchConfig | None = None,
-    use_trimmed_mask: bool = False,
-    export_artifacts: bool = True,
     log_fn=None,
 ) -> dict[str, Any]:
-    _log_fn = log_fn or (lambda msg: print(msg))
+    if callable(log_fn):
+        log = log_fn
+    else:
+        def log(message: str) -> None:
+            print(message, flush=True)
     before_path = Path(before_dir).expanduser().resolve()
     replay_path = Path(replay_dir).expanduser().resolve()
     out_path = Path(save_dir).expanduser().resolve()
@@ -6344,1369 +2298,207 @@ def run_dof_cached_pair(
         "log_root": replay_path.parent.parent,
         "memory_dir": str(memory_dir or ""),
     }
-    row = _dof_result_row(pair, out_path)
+    row = _result_row(pair, out_path)
 
     try:
-        before = _load_dof_artifact_sample(before_path, is_replay=False, use_trimmed_mask=use_trimmed_mask)
-        after = _load_dof_artifact_sample(replay_path, is_replay=True, use_trimmed_mask=use_trimmed_mask)
-        K = before["K"]
-        cfg = RegistrationConfig(voxel_size=voxel_size)
-        cfg_used = cfg
-        try:
-            result = run_reestimation(
-                before_rgb=before["rgb"], before_depth=before["depth"], before_mask=before["mask"],
-                after_rgb=after["rgb"], after_depth=after["depth"], after_mask=after["mask"],
-                K_wrist=K, use_coarse_fine=use_coarse_fine, enable_pcd_fit=enable_pcd_fit,
-                enable_lightglue_init=enable_lightglue_init, enable_tapir_init=enable_tapir_init,
-                init_candidate_mode=init_candidate_mode,
-                tapir_cfg=tapir_cfg,
-                cfg=cfg_used,
-            )
-        except Exception as first_err:
-            err_msg = str(first_err)
-            if (
-                "No valid object points after mask/depth filtering" in err_msg
-                or "Point cloud became empty" in err_msg
-            ):
-                cfg_used = replace(
-                    cfg,
-                    erode_kernel=1,
-                    erode_iters=0,
-                    remove_depth_edge_points=False,
-                    iqr_multiplier=0.0,
-                    outlier_nb_neighbors=8,
-                    outlier_std_ratio=2.5,
-                    radius_outlier_radius=0.0,
-                    radius_outlier_min_neighbors=0,
-                    min_visible_points=20,
-                )
-                _log_fn("  retry with relaxed point-cloud filters")
-                result = run_reestimation(
-                    before_rgb=before["rgb"], before_depth=before["depth"], before_mask=before["mask"],
-                    after_rgb=after["rgb"], after_depth=after["depth"], after_mask=after["mask"],
-                    K_wrist=K, use_coarse_fine=use_coarse_fine, enable_pcd_fit=enable_pcd_fit,
-                    enable_lightglue_init=enable_lightglue_init, enable_tapir_init=enable_tapir_init,
-                    init_candidate_mode=init_candidate_mode,
-                    tapir_cfg=tapir_cfg,
-                    cfg=cfg_used,
-                )
-            else:
-                raise
-        out_path.mkdir(parents=True, exist_ok=True)
-        _write_dof_pair_outputs(out_path, before, after, result, cfg_used, pair, export_artifacts)
-        _fill_dof_metrics(row, result)
+        before = _load_dof_artifact_sample(before_path, is_replay=False)
+        after = _load_dof_artifact_sample(replay_path, is_replay=True)
+        cfg_used = _merge_registration_cfg(RegistrationConfig(voxel_size=float(voxel_size)), after)
+        tapir_cfg_used = _merge_tapir_cfg(tapir_cfg or TapirMatchConfig(), after)
+        tapir_cfg_used = replace(
+            tapir_cfg_used,
+            verbose_timings=True,
+            log_fn=log,
+            case_tag=_parse_replay_dir_name(replay_path.name),
+        )
+        result = run_reestimation(
+            before=before,
+            after=after,
+            tapir_cfg=tapir_cfg_used,
+            cfg=cfg_used,
+            log_fn=log,
+        )
+
+        _write_pair_outputs(out_path, pair, before, after, result, cfg_used)
+        _fill_result_row(row, result)
         return {"success": True, "row": row, "result": result, "save_dir": str(out_path)}
     except Exception as exc:
         out_path.mkdir(parents=True, exist_ok=True)
         row["error"] = str(exc)
-        try:
-            error_method = _normalize_init_candidate_mode(init_candidate_mode)
-        except Exception:
-            error_method = init_candidate_mode or "unknown"
-        error_path = out_path / f"{_safe_artifact_stem(error_method)}_error.txt"
-        with open(error_path, "w", encoding="utf-8") as f:
-            f.write(str(exc) + "\n\n" + traceback.format_exc())
+        with open(out_path / "tapir_error.txt", "w", encoding="utf-8") as handle:
+            handle.write(str(exc) + "\n\n" + traceback.format_exc())
         return {"success": False, "row": row, "error": str(exc), "save_dir": str(out_path)}
+
+
+def _save_batch_summary(csv_path: Path, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "case_name",
+        "init_method",
+        "ok",
+        "quality",
+        "before_id",
+        "replay_id",
+        "elapsed_s",
+        "best_init",
+        "best_score",
+        "tapir_success",
+        "tapir_backend",
+        "tapir_remote_host",
+        "tapir_remote_port",
+        "tapir_matches",
+        "tapir_valid3d",
+        "tapir_inliers",
+        "tapir_inlier_ratio",
+        "tapir_rmse_m",
+        "tapir_track_e2e_ms",
+        "tapir_track_no_remote_roundtrip_ms",
+        "tapir_track_no_rpc_io_ms",
+        "tapir_init_e2e_ms",
+        "tapir_init_no_remote_roundtrip_ms",
+        "tapir_init_no_rpc_io_ms",
+        "visibility_score",
+        "visible_count",
+        "depth_ok_ratio",
+        "gicp_fitness",
+        "gicp_rmse_m",
+        "colored_icp_fitness",
+        "colored_icp_rmse_m",
+        "save_dir",
+        "error",
+    ]
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def run_dof_batch(
     dof_match_dir: str | os.PathLike[str],
-    output_dir: str | os.PathLike[str] = "dof_batch_results",
+    output_dir: str | os.PathLike[str] = DEFAULT_OUTPUT_DIR,
     start: int = 0,
     limit: int | None = None,
     voxel_size: float = 0.003,
-    use_coarse_fine: bool = True,
-    enable_pcd_fit: bool = True,
-    enable_lightglue_init: bool = True,
-    enable_tapir_init: bool = True,
-    init_candidate_mode: str = "auto",
     tapir_cfg: TapirMatchConfig | None = None,
-    use_trimmed_mask: bool = False,
-    export_artifacts: bool = True,
     log_fn=None,
 ) -> dict[str, Any]:
-    _log_fn = log_fn or (lambda msg: print(msg))
+    if callable(log_fn):
+        log = log_fn
+    else:
+        def log(message: str) -> None:
+            print(message, flush=True)
     out_root = Path(output_dir).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+
     pairs = _iter_dof_pairs(dof_match_dir)
     if start > 0:
         pairs = pairs[start:]
     if limit is not None and limit > 0:
         pairs = pairs[:limit]
-    rows: list[dict[str, Any]] = []
 
-    _log_fn(f"Found {len(pairs)} DOF replay pairs")
-    for idx, pair in enumerate(pairs, start=1):
+    rows: list[dict[str, Any]] = []
+    used_output_names: set[str] = set()
+    log(f"Found {len(pairs)} DOF replay pairs")
+    for index, pair in enumerate(pairs, start=1):
         before_dir = pair.get("before_dir")
         replay_dir = pair["replay_dir"]
-        log_root = pair["log_root"]
-        log_name = log_root.name
-        pair_save_dir = out_root / log_name / replay_dir.name
+        pair_save_dir = out_root / _case_output_dirname(pair, used_output_names)
         if before_dir is None:
-            row = _dof_result_row(pair, pair_save_dir)
+            row = _result_row(pair, pair_save_dir)
             row["error"] = f"Cannot resolve memory_dir: {pair.get('memory_dir', '')}"
             rows.append(row)
-            _log_fn(f"[{idx}/{len(pairs)}] SKIP {replay_dir.name}: {row['error']}")
+            log(f"[{index}/{len(pairs)}] SKIP {replay_dir.name}: {row['error']}")
             continue
-        pair["memory_dir"] = pair.get("memory_dir", "")
-        _log_fn(f"[{idx}/{len(pairs)}] {before_dir.name} -> {replay_dir.name}")
+
+        log(f"[{index}/{len(pairs)}] {before_dir.name} -> {replay_dir.name}")
         ret = run_dof_cached_pair(
             before_dir=before_dir,
             replay_dir=replay_dir,
             save_dir=pair_save_dir,
             memory_dir=pair.get("memory_dir", ""),
             voxel_size=voxel_size,
-            use_coarse_fine=use_coarse_fine,
-            enable_pcd_fit=enable_pcd_fit,
-            enable_lightglue_init=enable_lightglue_init,
-            enable_tapir_init=enable_tapir_init,
-            init_candidate_mode=init_candidate_mode,
             tapir_cfg=tapir_cfg,
-            use_trimmed_mask=use_trimmed_mask,
-            export_artifacts=export_artifacts,
-            log_fn=_log_fn,
+            log_fn=log,
         )
         row = ret["row"]
-        row["memory_dir"] = pair.get("memory_dir", "")
         rows.append(row)
         status = "OK" if ret.get("success") else "FAIL"
-        detail = row.get("quality", "") if ret.get("success") else row.get("error", "")
-        _log_fn(f"  {status}: {detail} save={ret.get('save_dir')}")
+        detail = row.get("quality") or row.get("error") or ""
+        log(f"  {status}: {detail} save={ret.get('save_dir')}")
+        if ret.get("success") and ret.get("result") is not None:
+            result = ret["result"]
+            stage_timings = result.debug.get("stage_timings_s") or {}
+            tapir_timings = ((result.debug.get("tapir_init") or {}).get("timings_s")) or {}
+            log(
+                "  timings(ms): "
+                + " ".join(
+                    f"{name}={float(value) * 1000.0:.1f}"
+                    for name, value in stage_timings.items()
+                )
+            )
+            if tapir_timings:
+                log(
+                    "  tapir_detail(ms): "
+                    + " ".join(
+                        f"{name}={float(value) * 1000.0:.1f}"
+                        for name, value in tapir_timings.items()
+                    )
+                )
 
-    # 生成新结构的batch_summary.csv：case_name, init_method, 然后是metrics
     csv_path = out_root / "batch_summary.csv"
-    summary_rows = _save_incremental_batch_summary(csv_path, rows)
-    old_html_path = out_root / "batch_summary.html"
-    if old_html_path.exists():
-        old_html_path.unlink()
-    xlsx_path = _save_colored_batch_summary_xlsx(out_root / "batch_summary.xlsx", summary_rows)
-    
-    # 保留JSON格式用于备查
     json_path = out_root / "batch_summary.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(_sanitize_init_names_for_output(summary_rows), f, indent=2, default=str)
-    msg = f"Summary written: {csv_path}"
-    if xlsx_path:
-        msg += f" | {xlsx_path}"
-    else:
-        msg += " | batch_summary.xlsx skipped (openpyxl unavailable)"
-    _log_fn(msg)
-    
+    _save_batch_summary(csv_path, rows)
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(rows, handle, indent=2, default=str)
+
     ok_count = sum(1 for row in rows if row.get("ok"))
-    return {
+    summary = {
         "success": True,
         "total": len(rows),
         "ok": ok_count,
         "failed": len(rows) - ok_count,
         "output_dir": str(out_root),
         "csv_path": str(csv_path),
-        "xlsx_path": str(xlsx_path) if xlsx_path else "",
         "json_path": str(json_path),
         "rows": rows,
     }
-
-
-def _parse_replay_dir_name(replay_dir_name: str) -> str:
-    """Extract short case name from replay_dir name.
-    E.g. '20260415_191534_20260410_181116_reasoner_teach_dof_replay_1775815876190' -> '20260415_191534'
-    """
-    parts = replay_dir_name.split('_')
-    if len(parts) >= 2:
-        return f"{parts[0]}_{parts[1]}"
-    return replay_dir_name[:20]
-
-
-def _save_incremental_batch_summary(csv_path: Path, new_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Save batch_summary.csv with structure: case_name, init_method, metrics...
-    Merges with existing data, preserving metrics for same (case_name, init_method) pairs,
-    and sorting by case_name and init_method.
-    """
-    metric_fields = [
-        "ok", "error", "quality", "mode", "elapsed_s", 
-        "init_candidate_mode", "candidate_inits",
-        "best_init", "best_score",
-        "gicp_fitness", "gicp_rmse_m", 
-        "colored_icp_fitness", "colored_icp_rmse_m",
-        "silhouette_f1", "silhouette_iou", 
-        "cloud_overlap_f1", "cloud_overlap_chamfer_m",
-        "shape_weight", "shape_score",
-        "lightglue_enabled", "lightglue_success",
-        "lightglue_matches", "lightglue_inliers", "lightglue_rmse_m",
-        "tapir_enabled", "tapir_success",
-        "tapir_matches", "tapir_inliers", "tapir_rmse_m",
-    ]
-    key_fields = ['case_name', 'init_method']
-    all_fields = key_fields + metric_fields
-    
-    existing = {}
-    if csv_path.exists():
-        with open(csv_path, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                case_name = row.get('case_name', '')
-                init_method = str(_display_init_name(row.get('init_method', '')))
-                if case_name and init_method:
-                    key = (case_name, init_method)
-                    existing[key] = _sanitize_init_names_for_output(row)
-    
-    for old_row in new_rows:
-        replay_name = old_row.get('replay_id', '')
-        if not replay_name:
-            continue
-        
-        case_name = _parse_replay_dir_name(replay_name)
-        init_method = str(old_row.get('init_candidate_mode') or old_row.get('best_init') or 'unknown').strip() or 'unknown'
-        init_method = str(_display_init_name(init_method))
-        
-        new_row = {
-            'case_name': case_name,
-            'init_method': init_method,
-        }
-        for field in metric_fields:
-            new_row[field] = old_row.get(field, '')
-        new_row = _sanitize_init_names_for_output(new_row)
-        
-        key = (case_name, init_method)
-        existing[key] = new_row
-    
-    sorted_keys = sorted(existing.keys(), key=lambda k: (k[0], k[1]))
-    sorted_rows = [existing[key] for key in sorted_keys]
-    
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(csv_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=all_fields, extrasaction='ignore')
-        writer.writeheader()
-        for row in sorted_rows:
-            writer.writerow(row)
-    return sorted_rows
-
-
-def _batch_summary_fields(rows: list[dict[str, Any]]) -> list[str]:
-    preferred = [
-        "case_name", "init_method", "ok", "quality", "best_init", "best_score",
-        "silhouette_f1", "silhouette_iou", "cloud_overlap_f1", "cloud_overlap_chamfer_m",
-        "gicp_fitness", "gicp_rmse_m", "shape_weight", "shape_score",
-        "lightglue_success", "lightglue_matches", "lightglue_inliers",
-        "tapir_success", "tapir_matches", "tapir_inliers",
-        "elapsed_s", "error",
-    ]
-    seen = set()
-    fields: list[str] = []
-    for field in preferred:
-        if any(field in row for row in rows):
-            fields.append(field)
-            seen.add(field)
-    for row in rows:
-        for field in row.keys():
-            if field not in seen:
-                fields.append(field)
-                seen.add(field)
-    return fields or preferred
-
-
-def _case_color_map(rows: list[dict[str, Any]]) -> dict[str, str]:
-    palette = [
-        "#eef7ff", "#f3fae8", "#fff5d9", "#f2f0ff",
-        "#e9fbf6", "#ffeef1", "#f5f7ea", "#edf8fb",
-    ]
-    colors: dict[str, str] = {}
-    for row in rows:
-        case_name = str(row.get("case_name", ""))
-        if case_name and case_name not in colors:
-            colors[case_name] = palette[len(colors) % len(palette)]
-    return colors
-
-
-def _summary_xlsx_cell_value(value: Any) -> tuple[Any, bool]:
-    if value is None:
-        return "", False
-    if isinstance(value, bool):
-        return value, False
-    if isinstance(value, int):
-        return value, False
-    if isinstance(value, float):
-        if not np.isfinite(value):
-            return "", False
-        return math.trunc(value * 100000.0) / 100000.0, True
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return "", False
-        if text.lower() in {"true", "false"}:
-            return value, False
-        try:
-            number = float(text)
-        except ValueError:
-            return value, False
-        if not np.isfinite(number):
-            return "", False
-        if re.fullmatch(r"[+-]?\d+", text):
-            return int(text), False
-        return math.trunc(number * 100000.0) / 100000.0, True
-    return value, False
-
-
-def _save_colored_batch_summary_xlsx(xlsx_path: Path, rows: list[dict[str, Any]]) -> Path | None:
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
-    except Exception:
-        return None
-
-    fields = _batch_summary_fields(rows)
-    case_colors = _case_color_map(rows)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "summary"
-    header_fill = PatternFill("solid", fgColor="243B53")
-    header_font = Font(color="FFFFFF", bold=True)
-    for col, field in enumerate(fields, start=1):
-        cell = ws.cell(row=1, column=col, value=field)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="left")
-
-    last_case = None
-    for row_idx, row in enumerate(rows, start=2):
-        case_name = str(row.get("case_name", ""))
-        color = case_colors.get(case_name, "#FFFFFF").lstrip("#").upper()
-        fill = PatternFill("solid", fgColor=color)
-        for col, field in enumerate(fields, start=1):
-            if field == "case_name":
-                cell_value, is_truncated_float = row.get(field, ""), False
-            else:
-                cell_value, is_truncated_float = _summary_xlsx_cell_value(row.get(field, ""))
-            cell = ws.cell(row=row_idx, column=col, value=cell_value)
-            cell.fill = fill
-            if is_truncated_float:
-                cell.number_format = "0.00000"
-            if field == "error" and row.get(field):
-                cell.font = Font(color="B42318", bold=True)
-        last_case = case_name
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-    for col, field in enumerate(fields, start=1):
-        width = max(len(str(field)) + 2, 10)
-        for row in rows[:80]:
-            width = min(max(width, len(str(row.get(field, ""))) + 2), 44)
-        ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = width
-
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(xlsx_path)
-    return xlsx_path
-
-
-# ============================================================================
-# StereoNet result browser — browse & pick before/after from data dir
-# ============================================================================
-
-class _StereoNetBrowser:
-    """Browse stereonet_result data and run pipeline on selected before/after pairs.
-
-    Layout: left = input (index list + image selection), right = output (results).
-    """
-
-    def __init__(
-        self, data_dir: str,
-        sam3_url: str = DEFAULT_SAM3_URL,
-        s2m2_url: str = DEFAULT_S2M2_URL,
-        voxel_size: float = 0.003,
-        use_coarse_fine: bool = True,
-        object_name: str = "",
-        enable_lightglue_init: bool = True,
-        enable_tapir_init: bool = True,
-        init_candidate_mode: str = "auto",
-        tapir_cfg: TapirMatchConfig | None = None,
-    ):
-        import tkinter as _tk
-        from tkinter import ttk as _ttk
-        from PIL import Image as PILImage, ImageTk as _ImageTk
-
-        self._tk = _tk
-        self._ttk = _ttk
-        self._PILImage = PILImage
-        self._ImageTk = _ImageTk
-        self.data_dir = os.path.abspath(data_dir)
-        self.sam3_url = sam3_url
-        self.s2m2_url = s2m2_url
-        self.voxel_size = voxel_size
-        self.use_coarse_fine = use_coarse_fine
-        self.enable_lightglue_init_default = bool(enable_lightglue_init)
-        self.enable_tapir_init_default = bool(enable_tapir_init)
-        self.init_candidate_mode = str(init_candidate_mode or "auto")
-        self.tapir_cfg = tapir_cfg
-
-        self.indices = self._scan_indices()
-        if not self.indices:
-            raise RuntimeError(f"No origin_L/R data found in {data_dir}")
-
-        intr_path = os.path.join(self.data_dir, "camera_intrinsic_origin.txt")
-        if not os.path.isfile(intr_path):
-            raise RuntimeError(f"Missing {intr_path}")
-        self.intrinsic_path = intr_path
-
-        self.before_idx: str | None = self.indices[0] if self.indices else None
-        self.after_idx: str | None = self.indices[1] if len(self.indices) > 1 else None
-        self._last_run_pcds = None
-        self._last_run_info = ""
-        self._download_path: str | None = None
-        self._result_dir_path: str | None = None
-        self._metric_summary_path: str | None = None
-
-        self.root = _tk.Tk()
-        self.root.title("Local App — StereoNet Browser")
-        self.root.geometry("1600x940")
-        self.obj_name_var = _tk.StringVar(value=object_name)
-        self._build_ui()
-
-    def _scan_indices(self) -> list[str]:
-        indices: set[str] = set()
-        for f in os.listdir(self.data_dir):
-            if f.endswith("_origin_L.png"):
-                idx_str = f[: -len("_origin_L.png")]
-                if os.path.isfile(os.path.join(self.data_dir, f"{idx_str}_origin_R.png")):
-                    indices.add(idx_str)
-        return sorted(indices)
-
-    def _build_ui(self):
-        _tk, _ttk = self._tk, self._ttk
-
-        # ── Title bar ──
-        title_frame = _ttk.Frame(self.root, padding=(8, 4))
-        title_frame.pack(fill="x")
-        _ttk.Label(
-            title_frame,
-            text=f"StereoNet Browser — {len(self.indices)} 组数据",
-            font=("", 14, "bold"),
-        ).pack(side="left")
-        _ttk.Label(
-            title_frame,
-            text=f"路径: {self.data_dir}  |  内参: camera_intrinsic_origin.txt",
-            foreground="gray",
-        ).pack(side="right")
-
-        # ── Main body: Left | Right ──
-        body = _ttk.PanedWindow(self.root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        self.body_pane = body
-
-        # =====================================================================
-        # LEFT PANEL — Input
-        # =====================================================================
-        left = _ttk.Frame(body)
-        body.add(left, weight=1)
-
-        # -- Index list + preview --
-        top_left = _ttk.Frame(left)
-        top_left.pack(fill="both", expand=True)
-
-        # Index list
-        list_frame = _ttk.LabelFrame(top_left, text="序号列表")
-        list_frame.pack(side="left", fill="y", padx=(0, 4))
-        list_inner = _ttk.Frame(list_frame)
-        list_inner.pack(fill="both", expand=True)
-        scrollbar = _ttk.Scrollbar(list_inner)
-        scrollbar.pack(side="right", fill="y")
-        self.listbox = _tk.Listbox(
-            list_inner, width=10, yscrollcommand=scrollbar.set, font=("Courier", 11),
-        )
-        self.listbox.pack(side="left", fill="both", expand=True)
-        scrollbar.config(command=self.listbox.yview)
-        for idx in self.indices:
-            self.listbox.insert("end", idx)
-        self.listbox.bind("<<ListboxSelect>>", self._on_list_select)
-
-        # Preview + buttons
-        preview_panel = _ttk.Frame(top_left)
-        preview_panel.pack(side="left", fill="both", expand=True)
-
-        preview_lf = _ttk.LabelFrame(preview_panel, text="预览 (点击序号)")
-        preview_lf.pack(fill="both", expand=True, pady=(0, 4))
-        self.preview_canvas = _tk.Canvas(preview_lf, height=180, bg="#fafafa")
-        self.preview_canvas.pack(fill="both", expand=True, padx=4, pady=4)
-        self.preview_info_var = _tk.StringVar(value="当前高亮: -")
-        _ttk.Label(
-            preview_panel,
-            textvariable=self.preview_info_var,
-            foreground="gray",
-        ).pack(fill="x", pady=(0, 2))
-
-        btn_frame = _ttk.Frame(preview_panel)
-        btn_frame.pack(fill="x", pady=4)
-        _ttk.Button(btn_frame, text="设为 Before (抓取前)",
-                     command=self._set_before).pack(side="left", padx=(0, 6))
-        _ttk.Button(btn_frame, text="设为 After (抓取后)",
-                     command=self._set_after).pack(side="left")
-
-        # -- Before / After images side-by-side --
-        pair_outer = _ttk.LabelFrame(left, text="当前选择")
-        pair_outer.pack(fill="x", pady=(4, 0))
-
-        self.before_var = _tk.StringVar(value="Before: 未选择")
-        self.after_var = _tk.StringVar(value="After: 未选择")
-        self.selection_summary_var = _tk.StringVar(value="当前配对: -")
-
-        _ttk.Label(
-            pair_outer,
-            textvariable=self.selection_summary_var,
-            foreground="gray",
-        ).pack(anchor="w", padx=4, pady=(4, 0))
-
-        pair = _ttk.Frame(pair_outer)
-        pair.pack(fill="x", padx=4, pady=4)
-
-        bf = _ttk.Frame(pair)
-        bf.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        _ttk.Label(bf, textvariable=self.before_var, foreground="#2e7d32",
-                    font=("", 10, "bold")).pack(anchor="w")
-        self.before_canvas = _tk.Canvas(bf, height=140, bg="#e8f5e9")
-        self.before_canvas.pack(fill="both", expand=True)
-
-        af = _ttk.Frame(pair)
-        af.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        _ttk.Label(af, textvariable=self.after_var, foreground="#1565c0",
-                    font=("", 10, "bold")).pack(anchor="w")
-        self.after_canvas = _tk.Canvas(af, height=140, bg="#e3f2fd")
-        self.after_canvas.pack(fill="both", expand=True)
-
-        # -- Run controls --
-        run_frame = _ttk.Frame(left)
-        run_frame.pack(fill="x", pady=(6, 0))
-        _ttk.Label(run_frame, text="物体名称:").pack(side="left")
-        _ttk.Entry(run_frame, textvariable=self.obj_name_var, width=14).pack(
-            side="left", padx=(4, 8))
-        _ttk.Button(run_frame, text="运行 Re-Estimation",
-                     command=self._on_run).pack(side="left")
-        self.run_status_var = _tk.StringVar(value="就绪")
-        _ttk.Label(run_frame, textvariable=self.run_status_var,
-                    foreground="gray").pack(side="left", padx=8)
-
-        # =====================================================================
-        # RIGHT PANEL — Output
-        # =====================================================================
-        right = _ttk.Frame(body)
-        body.add(right, weight=4)
-        right_outer = _ttk.Frame(right)
-        right_outer.pack(fill="both", expand=True)
-        self.results_scroll = _ttk.Scrollbar(right_outer, orient="vertical")
-        self.results_scroll.pack(side="right", fill="y")
-        self.results_canvas = _tk.Canvas(
-            right_outer,
-            bg=self.root.cget("bg"),
-            highlightthickness=0,
-            yscrollcommand=self.results_scroll.set,
-        )
-        self.results_canvas.pack(side="left", fill="both", expand=True)
-        self.results_scroll.config(command=self.results_canvas.yview)
-
-        right_lf = _ttk.LabelFrame(self.results_canvas, text="结果输出")
-        self.results_inner = right_lf
-        self.results_window = self.results_canvas.create_window((0, 0), window=right_lf, anchor="nw")
-        self.results_canvas.bind("<Configure>", self._on_results_canvas_configure)
-        right_lf.bind("<Configure>", self._on_results_inner_configure)
-
-        action_row = _ttk.Frame(right_lf)
-        action_row.pack(fill="x", padx=4, pady=(4, 2))
-        self.download_btn = _ttk.Button(
-            action_row, text="下载结果包", command=self._open_download_path, state="disabled",
-        )
-        self.download_btn.pack(side="left")
-        self.result_dir_btn = _ttk.Button(
-            action_row, text="打开结果目录", command=self._open_result_dir, state="disabled",
-        )
-        self.result_dir_btn.pack(side="left", padx=(6, 0))
-        self.view3d_btn = _ttk.Button(
-            action_row, text="打开 3D 点云查看器",
-            command=self._open_3d_viewer, state="disabled",
-        )
-        self.view3d_btn.pack(side="left", padx=(6, 0))
-        self.jump_2d_btn = _ttk.Button(
-            action_row, text="跳到二维结果",
-            command=self._scroll_to_reg2d,
-        )
-        self.jump_2d_btn.pack(side="left", padx=(6, 0))
-        self.metric_summary_btn = _ttk.Button(
-            action_row, text="查看 metric",
-            command=self._open_metric_summary, state="disabled",
-        )
-        self.metric_summary_btn.pack(side="left", padx=(6, 0))
-
-        # -- Result summary text --
-        text_frame = _ttk.Frame(right_lf)
-        text_frame.pack(fill="x", expand=False, padx=4, pady=(4, 2))
-        text_scroll = _ttk.Scrollbar(text_frame)
-        text_scroll.pack(side="right", fill="y")
-        self.result_text = _tk.Text(
-            text_frame, height=13, wrap="word", font=("SF Mono", 9),
-            bg="#1e1e2e", fg="#cdd6f4", insertbackground="#cdd6f4",
-            state="disabled", yscrollcommand=text_scroll.set,
-        )
-        self.result_text.pack(fill="x", expand=True)
-        text_scroll.config(command=self.result_text.yview)
-        self._log_to_text("等待运行...\n\n提示: 在左侧选择 Before 和 After 序号，然后点击 [运行]")
-
-        # -- Detection / mask result images --
-        mask_frame = _ttk.LabelFrame(right_lf, text="Qwen + SAM3 中间结果")
-        mask_frame.pack(fill="both", expand=True, padx=4, pady=(2, 4))
-        mask_inner = _ttk.Frame(mask_frame)
-        mask_inner.pack(fill="x", padx=4, pady=4)
-
-        bm_frame = _ttk.Frame(mask_inner)
-        bm_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        _ttk.Label(bm_frame, text="Before: bbox + mask overlay").pack(anchor="w")
-        self.before_mask_canvas = _tk.Canvas(bm_frame, height=190, bg="#f5f5f5")
-        self.before_mask_canvas.pack(fill="both", expand=True)
-
-        am_frame = _ttk.Frame(mask_inner)
-        am_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        _ttk.Label(am_frame, text="After: bbox + mask overlay").pack(anchor="w")
-        self.after_mask_canvas = _tk.Canvas(am_frame, height=190, bg="#f5f5f5")
-        self.after_mask_canvas.pack(fill="both", expand=True)
-
-        det_text_frame = _ttk.Frame(mask_frame)
-        det_text_frame.pack(fill="x", padx=4, pady=(0, 4))
-        det_scroll = _ttk.Scrollbar(det_text_frame)
-        det_scroll.pack(side="right", fill="y")
-        self.detection_text = _tk.Text(
-            det_text_frame, height=6, wrap="word", font=("SF Mono", 9),
-            bg="#fafafa", fg="#303030", state="disabled",
-            yscrollcommand=det_scroll.set,
-        )
-        self.detection_text.pack(fill="x", expand=True)
-        det_scroll.config(command=self.detection_text.yview)
-        _ttk.Label(mask_frame, text="提示: 双击任意结果图可放大查看", foreground="gray").pack(anchor="e", padx=6, pady=(0, 4))
-
-        lightglue_frame = _ttk.LabelFrame(right_lf, text="SuperPoint-LightGlue 特征初始化")
-        lightglue_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        self.lightglue_canvas = _tk.Canvas(lightglue_frame, height=250, bg="#f5f5f5")
-        self.lightglue_canvas.pack(fill="both", expand=True, padx=4, pady=(4, 2))
-        lightglue_text_frame = _ttk.Frame(lightglue_frame)
-        lightglue_text_frame.pack(fill="x", padx=4, pady=(0, 4))
-        lightglue_scroll = _ttk.Scrollbar(lightglue_text_frame)
-        lightglue_scroll.pack(side="right", fill="y")
-        self.lightglue_text = _tk.Text(
-            lightglue_text_frame, height=4, wrap="word", font=("SF Mono", 9),
-            bg="#fafafa", fg="#303030", state="disabled",
-            yscrollcommand=lightglue_scroll.set,
-        )
-        self.lightglue_text.pack(fill="x", expand=True)
-        lightglue_scroll.config(command=self.lightglue_text.yview)
-
-        shape_frame = _ttk.LabelFrame(right_lf, text="Shape Fit 辅助结果")
-        shape_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        shape_inner = _ttk.Frame(shape_frame)
-        shape_inner.pack(fill="x", padx=4, pady=4)
-
-        bs_frame = _ttk.Frame(shape_inner)
-        bs_frame.pack(side="left", fill="both", expand=True, padx=(0, 4))
-        _ttk.Label(bs_frame, text="Before: primitive fit overlay").pack(anchor="w")
-        self.before_shape_canvas = _tk.Canvas(bs_frame, height=210, bg="#f5f5f5")
-        self.before_shape_canvas.pack(fill="both", expand=True)
-
-        as_frame = _ttk.Frame(shape_inner)
-        as_frame.pack(side="left", fill="both", expand=True, padx=(4, 0))
-        _ttk.Label(as_frame, text="After: primitive fit overlay").pack(anchor="w")
-        self.after_shape_canvas = _tk.Canvas(as_frame, height=210, bg="#f5f5f5")
-        self.after_shape_canvas.pack(fill="both", expand=True)
-
-        shape_text_frame = _ttk.Frame(shape_frame)
-        shape_text_frame.pack(fill="x", padx=4, pady=(0, 4))
-        shape_scroll = _ttk.Scrollbar(shape_text_frame)
-        shape_scroll.pack(side="right", fill="y")
-        self.shape_text = _tk.Text(
-            shape_text_frame, height=5, wrap="word", font=("SF Mono", 9),
-            bg="#fafafa", fg="#303030", state="disabled",
-            yscrollcommand=shape_scroll.set,
-        )
-        self.shape_text.pack(fill="x", expand=True)
-        shape_scroll.config(command=self.shape_text.yview)
-
-        reg2d_frame = _ttk.LabelFrame(right_lf, text="二维配准叠加")
-        self.reg2d_frame = reg2d_frame
-        reg2d_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        self.reg2d_canvas = _tk.Canvas(reg2d_frame, height=360, bg="#f5f5f5")
-        self.reg2d_canvas.pack(fill="both", expand=True, padx=4, pady=(4, 2))
-
-        link_row = _ttk.Frame(reg2d_frame)
-        link_row.pack(fill="x", padx=4, pady=(0, 4))
-        self.download_var = _tk.StringVar(value="下载包: 暂无")
-        self.download_link = _tk.Label(
-            link_row,
-            textvariable=self.download_var,
-            fg="#555555",
-            cursor="arrow",
-            anchor="w",
-        )
-        self.download_link.pack(side="left", fill="x", expand=True)
-        _ttk.Label(link_row, text="右侧支持整体滚动；双击图片可放大", foreground="gray").pack(side="right")
-
-        self._set_lightglue_text("SuperPoint-LightGlue 默认启用；只有通过 RANSAC 门槛才会加入候选，最终由点云评分决定是否采用。")
-        self._set_shape_text("等待运行后显示 primitive fit 类型、尺寸、残差和端点信息")
-        self.root.after(80, self._set_initial_split)
-        self._init_default_selection()
-
-    # ── helpers ──
-
-    def _set_initial_split(self):
-        try:
-            total_w = max(self.body_pane.winfo_width(), self.root.winfo_width() - 24, 1000)
-            left_w = max(320, int(total_w * 0.28))
-            self.body_pane.sashpos(0, left_w)
-        except Exception:
-            pass
-
-    def _init_default_selection(self):
-        if not self.indices:
-            return
-        self.listbox.selection_clear(0, "end")
-        self.listbox.selection_set(0)
-        self.listbox.activate(0)
-        self.listbox.see(0)
-        self._on_list_select()
-        if self.before_idx is not None:
-            self._refresh_before_preview()
-        if self.after_idx is not None:
-            self._refresh_after_preview()
-        self._refresh_selection_summary()
-
-    def _log_to_text(self, msg: str, append: bool = False):
-        self.result_text.config(state="normal")
-        if not append:
-            self.result_text.delete("1.0", "end")
-        self.result_text.insert("end", msg + "\n")
-        self.result_text.see("end")
-        self.result_text.config(state="disabled")
-        self.root.update_idletasks()
-
-    def _set_detection_text(self, msg: str):
-        self.detection_text.config(state="normal")
-        self.detection_text.delete("1.0", "end")
-        self.detection_text.insert("end", msg)
-        self.detection_text.config(state="disabled")
-        self.root.update_idletasks()
-
-    def _set_lightglue_text(self, msg: str):
-        self.lightglue_text.config(state="normal")
-        self.lightglue_text.delete("1.0", "end")
-        self.lightglue_text.insert("end", msg)
-        self.lightglue_text.config(state="disabled")
-        self.root.update_idletasks()
-
-    def _set_shape_text(self, msg: str):
-        self.shape_text.config(state="normal")
-        self.shape_text.delete("1.0", "end")
-        self.shape_text.insert("end", msg)
-        self.shape_text.config(state="disabled")
-        self.root.update_idletasks()
-
-    def _on_results_inner_configure(self, _event=None):
-        if hasattr(self, "results_canvas"):
-            self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
-
-    def _on_results_canvas_configure(self, event):
-        if hasattr(self, "results_window"):
-            self.results_canvas.itemconfigure(self.results_window, width=event.width)
-        self._on_results_inner_configure()
-
-    def _scroll_results_to_widget(self, widget, padding: int = 8):
-        if not hasattr(self, "results_canvas") or widget is None:
-            return
-        self.root.update_idletasks()
-        bbox = self.results_canvas.bbox("all")
-        if not bbox:
-            return
-        inner_h = max(int(bbox[3] - bbox[1]), 1)
-        canvas_h = max(int(self.results_canvas.winfo_height()), 1)
-        max_scroll = max(inner_h - canvas_h, 1)
-        try:
-            target_y = max(widget.winfo_rooty() - self.results_inner.winfo_rooty() - padding, 0)
-        except Exception:
-            target_y = max(widget.winfo_y() - padding, 0)
-        self.results_canvas.yview_moveto(float(np.clip(target_y / max_scroll, 0.0, 1.0)))
-
-    def _scroll_to_reg2d(self):
-        self._scroll_results_to_widget(getattr(self, "reg2d_frame", None))
-
-    def _open_image_popup(self, pil_img, title: str = "Image"):
-        if pil_img is None:
-            return
-        top = self._tk.Toplevel(self.root)
-        top.title(title)
-        top.geometry("1400x920")
-
-        ctrl = self._ttk.Frame(top)
-        ctrl.pack(fill="x", padx=6, pady=4)
-        self._ttk.Label(ctrl, text="缩放:").pack(side="left")
-        state = {"mode": "fit"}
-
-        canvas_frame = self._ttk.Frame(top)
-        canvas_frame.pack(fill="both", expand=True)
-        yscroll = self._ttk.Scrollbar(canvas_frame, orient="vertical")
-        yscroll.pack(side="right", fill="y")
-        xscroll = self._ttk.Scrollbar(canvas_frame, orient="horizontal")
-        xscroll.pack(side="bottom", fill="x")
-        canvas = self._tk.Canvas(
-            canvas_frame, bg="#111111",
-            xscrollcommand=xscroll.set, yscrollcommand=yscroll.set,
-            highlightthickness=0,
-        )
-        canvas.pack(fill="both", expand=True)
-        xscroll.config(command=canvas.xview)
-        yscroll.config(command=canvas.yview)
-
-        base_img = pil_img.copy()
-
-        def _render_popup(_event=None):
-            cw = max(canvas.winfo_width(), 400)
-            ch = max(canvas.winfo_height(), 300)
-            if state["mode"] == "fit":
-                scale = min(cw / max(base_img.width, 1), ch / max(base_img.height, 1))
-            else:
-                scale = float(state["mode"])
-            scale = max(scale, 0.05)
-            w = max(int(base_img.width * scale), 1)
-            h = max(int(base_img.height * scale), 1)
-            resized = base_img.resize((w, h), self._PILImage.Resampling.LANCZOS)
-            photo = self._ImageTk.PhotoImage(resized)
-            canvas.delete("all")
-            canvas.create_image(0, 0, anchor="nw", image=photo)
-            canvas._photo = photo
-            canvas.config(scrollregion=(0, 0, w, h))
-
-        def _set_zoom(mode):
-            state["mode"] = mode
-            _render_popup()
-
-        for label, mode in (("适应窗口", "fit"), ("100%", 1.0), ("150%", 1.5), ("200%", 2.0)):
-            self._ttk.Button(ctrl, text=label, command=lambda m=mode: _set_zoom(m)).pack(side="left", padx=(4, 0))
-
-        canvas.bind("<Configure>", _render_popup)
-        _render_popup()
-
-    def _open_canvas_popup(self, canvas):
-        pil_img = getattr(canvas, "_full_pil", None)
-        title = getattr(canvas, "_popup_title", "Image")
-        if pil_img is not None:
-            self._open_image_popup(pil_img, title=title)
-
-    def _set_viewer_enabled(self, enabled: bool):
-        self.view3d_btn.config(state="normal" if enabled else "disabled")
-
-    def _set_download_path(self, path: str | None, result_dir: str | None = None):
-        self._download_path = path if path and os.path.exists(path) else None
-        self._result_dir_path = result_dir if result_dir and os.path.isdir(result_dir) else None
-        metric_path = (
-            os.path.join(self._result_dir_path, "key_metrics_summary.txt")
-            if self._result_dir_path else None
-        )
-        self._metric_summary_path = metric_path if metric_path and os.path.isfile(metric_path) else None
-        if self._download_path:
-            self.download_var.set(f"下载包: {os.path.basename(self._download_path)}")
-            self.download_btn.config(state="normal")
-        else:
-            self.download_var.set("下载包: 暂无")
-            self.download_btn.config(state="disabled")
-        if self._result_dir_path:
-            self.result_dir_btn.config(state="normal")
-        else:
-            self.result_dir_btn.config(state="disabled")
-        if self._metric_summary_path:
-            self.metric_summary_btn.config(state="normal")
-        else:
-            self.metric_summary_btn.config(state="disabled")
-
-    def _open_path(self, path: str | None):
-        if not path or not os.path.exists(path):
-            self.run_status_var.set("文件不存在")
-            return
-        try:
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", path])
-            elif os.name == "nt":
-                os.startfile(path)  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["xdg-open", path])
-        except Exception as e:
-            self.run_status_var.set(f"打开失败: {e}")
-
-    def _open_download_path(self, _event=None):
-        self._open_path(self._download_path)
-
-    def _open_result_dir(self):
-        self._open_path(self._result_dir_path)
-
-    def _open_metric_summary(self):
-        self._open_path(self._metric_summary_path)
-
-    def _get_selected_idx(self) -> str | None:
-        sel = self.listbox.curselection()
-        return self.indices[sel[0]] if sel else None
-
-    def _refresh_selection_summary(self):
-        before = self.before_idx or "-"
-        after = self.after_idx or "-"
-        self.before_var.set(f"Before: {before}")
-        self.after_var.set(f"After: {after}")
-        self.selection_summary_var.set(
-            f"当前配对: pick前 = {before}   |   pick后 = {after}"
-        )
-
-    def _refresh_before_preview(self):
-        if self.before_idx is None:
-            self.before_canvas.delete("all")
-            self.before_canvas.create_text(10, 10, anchor="nw", text="未选择 Before", fill="gray")
-            return
-        self._show_on_canvas(
-            os.path.join(self.data_dir, f"{self.before_idx}_origin_L.png"),
-            self.before_canvas,
-            f"Before: {self.before_idx}",
-        )
-
-    def _refresh_after_preview(self):
-        if self.after_idx is None:
-            self.after_canvas.delete("all")
-            self.after_canvas.create_text(10, 10, anchor="nw", text="未选择 After", fill="gray")
-            return
-        self._show_on_canvas(
-            os.path.join(self.data_dir, f"{self.after_idx}_origin_L.png"),
-            self.after_canvas,
-            f"After: {self.after_idx}",
-        )
-
-    def _show_on_canvas(self, img_path_or_array, canvas, label: str = ""):
-        try:
-            if isinstance(img_path_or_array, str):
-                pil = self._PILImage.open(img_path_or_array)
-            else:
-                arr = np.asarray(img_path_or_array)
-                if arr.dtype != np.uint8:
-                    arr = np.clip(arr, 0, 255).astype(np.uint8)
-                pil = self._PILImage.fromarray(arr)
-            full_pil = pil.copy()
-            canvas.update_idletasks()
-            cw = max(canvas.winfo_width(), 200)
-            ch = max(canvas.winfo_height(), 120)
-            ratio = min(cw / pil.width, ch / pil.height)
-            pil = pil.resize((int(pil.width * ratio), int(pil.height * ratio)),
-                             self._PILImage.Resampling.LANCZOS)
-            photo = self._ImageTk.PhotoImage(pil)
-            canvas.delete("all")
-            canvas.create_image(cw // 2, ch // 2, anchor="center", image=photo)
-            if label:
-                canvas.create_text(5, 5, anchor="nw", text=label, fill="#1b5e20",
-                                   font=("", 10, "bold"))
-            canvas._photo = photo
-            canvas._full_pil = full_pil
-            canvas._popup_title = label or "Image"
-            canvas.bind("<Double-Button-1>", lambda _event, c=canvas: self._open_canvas_popup(c))
-        except Exception as e:
-            canvas.delete("all")
-            canvas.create_text(10, 10, anchor="nw", text=f"Error: {e}", fill="red")
-
-    def _on_list_select(self, _event=None):
-        idx = self._get_selected_idx()
-        if idx is None:
-            return
-        img_path = os.path.join(self.data_dir, f"{idx}_origin_L.png")
-        self._show_on_canvas(img_path, self.preview_canvas, f"序号 {idx}")
-        self.preview_info_var.set(
-            f"当前高亮: {idx}   |   图像: {idx}_origin_L.png / {idx}_origin_R.png"
-        )
-        self.run_status_var.set(f"已高亮序号 {idx}")
-
-    def _set_before(self):
-        idx = self._get_selected_idx()
-        if idx is None:
-            self.run_status_var.set("请先在列表中选择一个序号")
-            return
-        self.before_idx = idx
-        self._refresh_before_preview()
-        self._refresh_selection_summary()
-        self.run_status_var.set(f"已设置 pick前 序号: {idx}")
-
-    def _set_after(self):
-        idx = self._get_selected_idx()
-        if idx is None:
-            self.run_status_var.set("请先在列表中选择一个序号")
-            return
-        self.after_idx = idx
-        self._refresh_after_preview()
-        self._refresh_selection_summary()
-        self.run_status_var.set(f"已设置 pick后 序号: {idx}")
-
-    def _on_run(self):
-        if self.before_idx is None or self.after_idx is None:
-            self.run_status_var.set("请先选择 Before 和 After 序号")
-            return
-        if self.before_idx == self.after_idx:
-            self.run_status_var.set("Before 和 After 不能是同一组数据")
-            return
-
-        self.run_status_var.set(f"运行中...")
-        self._set_viewer_enabled(False)
-        self._last_run_pcds = None
-        self._last_run_info = ""
-        self._log_to_text(
-            f"开始运行  Before={self.before_idx}  After={self.after_idx}\n"
-            f"数据目录: {self.data_dir}\n"
-            f"内参文件: {self.intrinsic_path}\n"
-            + "=" * 50
-        )
-        self._set_detection_text("等待检测结果...")
-        self._set_lightglue_text("等待特征初始化结果...")
-        self._set_shape_text("等待形状拟合结果...")
-        self.lightglue_canvas.delete("all")
-        self.lightglue_canvas.create_text(
-            12, 12, anchor="nw",
-            text="等待 LightGlue matches...",
-            fill="gray",
-        )
-        self.before_shape_canvas.delete("all")
-        self.before_shape_canvas.create_text(12, 12, anchor="nw", text="等待 Before shape fit...", fill="gray")
-        self.after_shape_canvas.delete("all")
-        self.after_shape_canvas.create_text(12, 12, anchor="nw", text="等待 After shape fit...", fill="gray")
-        self.reg2d_canvas.delete("all")
-        self.reg2d_canvas.create_text(12, 12, anchor="nw", text="等待二维叠加结果...", fill="gray")
-        self._set_download_path(None, None)
-        if hasattr(self, "results_canvas"):
-            self.results_canvas.yview_moveto(0.0)
-        self.root.update()
-
-        before_l = os.path.join(self.data_dir, f"{self.before_idx}_origin_L.png")
-        before_r = os.path.join(self.data_dir, f"{self.before_idx}_origin_R.png")
-        after_l = os.path.join(self.data_dir, f"{self.after_idx}_origin_L.png")
-        after_r = os.path.join(self.data_dir, f"{self.after_idx}_origin_R.png")
-
-        try:
-            ret = run_local(
-                before_left_path=before_l, before_right_path=before_r,
-                after_left_path=after_l, after_right_path=after_r,
-                intrinsic_path=self.intrinsic_path,
-                object_name=self.obj_name_var.get().strip(),
-                sam3_url=self.sam3_url, s2m2_url=self.s2m2_url,
-                voxel_size=self.voxel_size,
-                use_coarse_fine=self.use_coarse_fine,
-                enable_pcd_fit=True,
-                enable_lightglue_init=self.enable_lightglue_init_default,
-                enable_tapir_init=self.enable_tapir_init_default,
-                init_candidate_mode=self.init_candidate_mode,
-                tapir_cfg=self.tapir_cfg,
-                parent=self.root,
-                show_viewer=False,
-                log_fn=lambda msg: self._log_to_text(msg, append=True),
-            )
-
-            result = ret["result"]
-            self._last_run_pcds = ret["pcds"]
-            self._last_run_info = "\n".join(ret["info_lines"])
-
-            if ret.get("before_mask_vis") is not None:
-                self._show_on_canvas(ret["before_mask_vis"], self.before_mask_canvas, "Before")
-            if ret.get("after_mask_vis") is not None:
-                self._show_on_canvas(ret["after_mask_vis"], self.after_mask_canvas, "After")
-            if ret.get("reg2d_vis") is not None:
-                self._show_on_canvas(ret["reg2d_vis"], self.reg2d_canvas, "2D Overlay")
-            self._set_detection_text(ret.get("detection_summary") or "无检测诊断")
-            if ret.get("lightglue_match_vis") is not None:
-                self._show_on_canvas(ret["lightglue_match_vis"], self.lightglue_canvas, "SuperPoint-LightGlue")
-            elif not ret.get("lightglue_init_enabled", False):
-                self.lightglue_canvas.delete("all")
-                self.lightglue_canvas.create_text(12, 12, anchor="nw", text="SuperPoint-LightGlue 未启用", fill="gray")
-            self._set_lightglue_text(ret.get("lightglue_summary") or ("SuperPoint-LightGlue 未启用" if not ret.get("lightglue_init_enabled", False) else "无特征诊断"))
-            if ret.get("before_shape_vis") is not None:
-                self._show_on_canvas(ret["before_shape_vis"], self.before_shape_canvas, "Before shape fit")
-            elif not ret.get("pcd_fit_enabled", True):
-                self.before_shape_canvas.delete("all")
-                self.before_shape_canvas.create_text(12, 12, anchor="nw", text="PCD-fit 已关闭", fill="gray")
-            if ret.get("after_shape_vis") is not None:
-                self._show_on_canvas(ret["after_shape_vis"], self.after_shape_canvas, "After shape fit")
-            elif not ret.get("pcd_fit_enabled", True):
-                self.after_shape_canvas.delete("all")
-                self.after_shape_canvas.create_text(12, 12, anchor="nw", text="PCD-fit 已关闭", fill="gray")
-            self._set_shape_text(ret.get("shape_summary") or "无形状拟合结果")
-            self._set_download_path(ret.get("bundle_path"), ret.get("save_dir"))
-            self._set_viewer_enabled(ret.get("pcds") is not None)
-
-            if ret.get("success") and result is not None:
-                q = result.debug.get("quality", {}).get("quality", "?")
-                self.run_status_var.set(
-                    f"完成 | {q.upper()} | {result.elapsed_s:.2f}s | 保存: {ret['save_dir']}"
-                )
-                if ret.get("reg2d_vis") is not None:
-                    self.root.after(80, self._scroll_to_reg2d)
-            else:
-                self.run_status_var.set(f"失败: {ret.get('error') or '未知错误'}")
-        except Exception as e:
-            self._set_viewer_enabled(False)
-            self._set_download_path(None, None)
-            self._set_lightglue_text("运行异常，未生成特征初始化结果")
-            self._set_shape_text("运行异常，未生成形状拟合结果")
-            self.run_status_var.set(f"失败: {e}")
-            self._log_to_text(f"\n{'='*50}\n失败: {e}\n{traceback.format_exc()}", append=True)
-
-    def _open_3d_viewer(self):
-        if self._last_run_pcds is None:
-            return
-        pcds = self._last_run_pcds
-        viewer = _LocalResultViewer(
-            pcds["before"], pcds["after"], pcds["aligned"],
-            after_scene_pcd=pcds.get("after_scene"),
-            info_text=getattr(self, "_last_run_info", ""),
-            parent=self.root,
-        )
-        viewer.run()
-
-    def run(self):
-        self.root.mainloop()
-
-
-# ============================================================================
-# Local launcher GUI (tkinter file picker)
-# ============================================================================
-
-class _LocalLauncher:
-    """Tkinter window with file pickers for all inputs, then runs pipeline + viewer."""
-
-    def __init__(self, init_candidate_mode: str = "auto", tapir_cfg: TapirMatchConfig | None = None):
-        import tkinter as _tk
-        from tkinter import filedialog as _fd, ttk as _ttk
-
-        self.root = _tk.Tk()
-        self.root.title("In-Hand Pose Re-Estimation — Local Launcher")
-        self.root.geometry("680x520")
-        self.root.resizable(True, True)
-
-        self._tk = _tk
-        self._fd = _fd
-        self.init_candidate_mode = str(init_candidate_mode or "auto")
-        self.tapir_cfg = tapir_cfg
-
-        main = _ttk.Frame(self.root, padding=12)
-        main.pack(fill="both", expand=True)
-
-        _ttk.Label(main, text="Post-Grasp In-Hand Pose Re-Estimation", font=("", 14, "bold")).pack(pady=(0, 8))
-
-        # File path variables
-        self.before_left_var = _tk.StringVar()
-        self.before_right_var = _tk.StringVar()
-        self.after_left_var = _tk.StringVar()
-        self.after_right_var = _tk.StringVar()
-        self.intrinsic_var = _tk.StringVar()
-        self.object_name_var = _tk.StringVar(value="")
-        self.sam3_url_var = _tk.StringVar(value=DEFAULT_SAM3_URL)
-        self.s2m2_url_var = _tk.StringVar(value=DEFAULT_S2M2_URL)
-        self.voxel_var = _tk.StringVar(value="0.003")
-        self.coarse_fine_var = _tk.BooleanVar(value=True)
-        self.status_var = _tk.StringVar(value="选择文件后点击 [运行]")
-
-        file_types = [("Image files", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")]
-        txt_types = [("Text files", "*.txt"), ("All files", "*.*")]
-
-        def _add_file_row(parent, label, var, ftypes):
-            row = _ttk.Frame(parent)
-            row.pack(fill="x", pady=2)
-            _ttk.Label(row, text=label, width=16, anchor="w").pack(side="left")
-            _ttk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True, padx=(4, 4))
-            _ttk.Button(row, text="浏览...", width=6,
-                        command=lambda: var.set(self._fd.askopenfilename(filetypes=ftypes) or var.get())
-                        ).pack(side="right")
-
-        _ttk.Label(main, text="抓取前 双目图像", font=("", 10, "bold"), anchor="w").pack(fill="x", pady=(8, 0))
-        _add_file_row(main, "左图:", self.before_left_var, file_types)
-        _add_file_row(main, "右图:", self.before_right_var, file_types)
-
-        _ttk.Label(main, text="抓取后 双目图像", font=("", 10, "bold"), anchor="w").pack(fill="x", pady=(8, 0))
-        _add_file_row(main, "左图:", self.after_left_var, file_types)
-        _add_file_row(main, "右图:", self.after_right_var, file_types)
-
-        _ttk.Label(main, text="相机内参", font=("", 10, "bold"), anchor="w").pack(fill="x", pady=(8, 0))
-        _add_file_row(main, "内参文件:", self.intrinsic_var, txt_types)
-
-        _ttk.Label(main, text="参数", font=("", 10, "bold"), anchor="w").pack(fill="x", pady=(8, 0))
-        params = _ttk.Frame(main)
-        params.pack(fill="x", pady=2)
-        _ttk.Label(params, text="物体名称:").pack(side="left")
-        _ttk.Entry(params, textvariable=self.object_name_var, width=16).pack(side="left", padx=(4, 12))
-        _ttk.Label(params, text="Voxel:").pack(side="left")
-        _ttk.Entry(params, textvariable=self.voxel_var, width=8).pack(side="left", padx=(4, 12))
-        _ttk.Checkbutton(params, text="Coarse-to-Fine", variable=self.coarse_fine_var).pack(side="left")
-
-        urls = _ttk.Frame(main)
-        urls.pack(fill="x", pady=2)
-        _ttk.Label(urls, text="S2M2:").pack(side="left")
-        _ttk.Entry(urls, textvariable=self.s2m2_url_var, width=32).pack(side="left", padx=(4, 8))
-        _ttk.Label(urls, text="SAM3:").pack(side="left")
-        _ttk.Entry(urls, textvariable=self.sam3_url_var, width=32).pack(side="left", padx=(4, 0))
-
-        btn_row = _ttk.Frame(main)
-        btn_row.pack(fill="x", pady=(12, 4))
-        _ttk.Button(btn_row, text="运行", command=self._on_run).pack(side="left", padx=(0, 8))
-        _ttk.Label(btn_row, textvariable=self.status_var, foreground="gray").pack(side="left", fill="x", expand=True)
-
-    def _on_run(self):
-        paths = {
-            "before_left": self.before_left_var.get().strip(),
-            "before_right": self.before_right_var.get().strip(),
-            "after_left": self.after_left_var.get().strip(),
-            "after_right": self.after_right_var.get().strip(),
-            "intrinsic": self.intrinsic_var.get().strip(),
-        }
-        missing = [k for k, v in paths.items() if not v]
-        if missing:
-            self.status_var.set(f"缺少: {', '.join(missing)}")
-            return
-        for k, v in paths.items():
-            if not os.path.isfile(v):
-                self.status_var.set(f"文件不存在: {v}")
-                return
-
-        self.status_var.set("运行中...")
-        self.root.update()
-
-        try:
-            ret = run_local(
-                before_left_path=paths["before_left"],
-                before_right_path=paths["before_right"],
-                after_left_path=paths["after_left"],
-                after_right_path=paths["after_right"],
-                intrinsic_path=paths["intrinsic"],
-                object_name=self.object_name_var.get().strip(),
-                sam3_url=self.sam3_url_var.get().strip(),
-                s2m2_url=self.s2m2_url_var.get().strip(),
-                voxel_size=float(self.voxel_var.get()),
-                use_coarse_fine=self.coarse_fine_var.get(),
-                enable_pcd_fit=True,
-                enable_lightglue_init=True,
-                enable_tapir_init=True,
-                init_candidate_mode=self.init_candidate_mode,
-                tapir_cfg=self.tapir_cfg,
-            )
-            if ret.get("success"):
-                self.status_var.set("完成")
-            else:
-                self.status_var.set(f"失败: {ret.get('error') or '未知错误'}")
-        except Exception as e:
-            self.status_var.set(f"失败: {e}")
-            traceback.print_exc()
-
-    def run(self):
-        self.root.mainloop()
-
-
-# ============================================================================
-# Entry
-# ============================================================================
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Post-Grasp In-Hand Pose Re-Estimation")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=7880)
-    parser.add_argument("--share", action="store_true")
-    parser.add_argument("--local", action="store_true",
-                        help="本地模式: 浏览 stereonet_result 序号列表并运行")
-    parser.add_argument("--local-files", action="store_true",
-                        help="本地文件模式: 手动选择左右图和内参")
-    parser.add_argument("--browse", action="store_true",
-                        help="兼容旧参数: 等同于 --local")
-    parser.add_argument("--data-dir", default="stereonet_result",
-                        help="stereonet_result 数据目录路径 (默认: stereonet_result)")
-    parser.add_argument("--object-name", default="", help="目标物体名称 (用于检测)")
-    parser.add_argument("--dof-batch", action="store_true",
-                        help="批量跑 dof_match 日志: teach_dof=before, teach_dof_replay=after")
-    parser.add_argument("--dof-match-dir", default="dof_match",
-                        help="dof_match 根目录，或包含 teach_dof/teach_dof_replay 的单个 log 目录")
-    parser.add_argument("--dof-output-dir", default="dof_batch_results",
-                        help="DOF 批处理输出目录")
-    parser.add_argument("--dof-start", type=int, default=0,
-                        help="DOF 批处理起始 offset")
-    parser.add_argument("--dof-limit", type=int, default=0,
-                        help="DOF 批处理最多运行多少条；0 表示不限制")
-    parser.add_argument("--dof-use-trimmed-mask", action="store_true",
-                        help="优先使用 object_trimmed/current_object_trimmed 像素作为 mask")
-    parser.add_argument("--dof-no-export-artifacts", action="store_true",
-                        help="只写 result/summary，不导出 ply 和 overlay")
-    parser.add_argument("--voxel-size", type=float, default=0.003,
-                        help="点云 voxel size，local/dof batch 使用")
-    parser.add_argument("--no-pcd-fit", dest="pcd_fit", action="store_false",
-                        help="关闭 primitive PCD-fit / shape prior")
-    parser.add_argument("--lightglue-init", dest="lightglue_init", action="store_true",
-                        help="启用 SuperPoint-LightGlue 初始化候选 (默认启用)")
-    parser.add_argument("--no-lightglue-init", dest="lightglue_init", action="store_false",
-                        help="关闭 SuperPoint-LightGlue 初始化候选")
-    parser.add_argument("--tapir-init", dest="tapir_init", action="store_true",
-                        help="启用 TAPIR 初始化候选 (默认启用)")
-    parser.add_argument("--no-tapir-init", dest="tapir_init", action="store_false",
-                        help="关闭 TAPIR 初始化候选")
-    parser.add_argument("--tapir-backend", choices=("auto", "tapir", "opencv_lk"), default="auto",
-                        help="TAPIR 后端: auto=优先真实 TAPIR adapter，否则 LK fallback")
-    parser.add_argument("--tapir-checkpoint", default="",
-                        help="真实 TAPIR checkpoint 路径")
-    parser.add_argument("--tapir-device", default="",
-                        help="真实 TAPIR 运行设备，例如 cpu/cuda/mps；留空由 adapter 决定")
-    parser.add_argument("--tapir-resize", type=int, default=256,
-                        help="TAPIR 推理方形 resize 尺寸，默认 256")
-    parser.add_argument("--feature-init", dest="lightglue_init", action="store_true",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--no-feature-init", dest="lightglue_init", action="store_false",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--init-method", choices=INIT_METHOD_CHOICES, default="auto",
-                        help="初始化候选方法: auto=全部竞争；其他值只跑该方法候选")
-    parser.add_argument("--lightglue", action="store_true",
-                        help="兼容旧参数: 等同于 --init-method lightglue")
-    parser.set_defaults(lightglue_init=True, tapir_init=True, pcd_fit=True)
-
+    log(
+        "Summary written: "
+        f"{summary['csv_path']} | {summary['json_path']}"
+    )
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TAPIR-only DOF batch pipeline")
+    parser.add_argument("dof_match_dir", nargs="?", default=DEFAULT_DOF_MATCH_DIR, help="dof_match root directory")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="batch output directory")
+    parser.add_argument("--start", type=int, default=0, help="start offset for batch cases")
+    parser.add_argument("--limit", type=int, default=0, help="maximum number of cases to run; 0 means no limit")
+    parser.add_argument("--voxel-size", type=float, default=0.003, help="point cloud voxel size in meters")
+    parser.add_argument("--tapir-host", default=DEFAULT_TAPIR_HOST, help="remote TAPIR host")
+    parser.add_argument("--tapir-port", type=int, default=DEFAULT_TAPIR_PORT, help="remote TAPIR port")
     args = parser.parse_args()
-    init_candidate_mode = "lightglue" if args.lightglue else args.init_method
-    if args.lightglue:
-        args.lightglue_init = True
-    if init_candidate_mode == "tapir":
-        args.tapir_init = True
+
     tapir_cfg = TapirMatchConfig(
-        backend=args.tapir_backend,
-        tapir_checkpoint_path=args.tapir_checkpoint,
-        tapir_device=(args.tapir_device or None),
-        tapir_resize_height=int(args.tapir_resize),
-        tapir_resize_width=int(args.tapir_resize),
+        backend="remote_tapnet",
+        remote_host=str(args.tapir_host),
+        remote_port=int(args.tapir_port),
+    )
+    summary = run_dof_batch(
+        dof_match_dir=args.dof_match_dir,
+        output_dir=args.output_dir,
+        start=max(int(args.start), 0),
+        limit=(int(args.limit) if int(args.limit) > 0 else None),
+        voxel_size=float(args.voxel_size),
+        tapir_cfg=tapir_cfg,
+    )
+    print(
+        f"TAPIR batch done: ok={summary['ok']} failed={summary['failed']} "
+        f"total={summary['total']} output={summary['output_dir']}"
     )
 
-    if args.dof_batch:
-        summary = run_dof_batch(
-            dof_match_dir=args.dof_match_dir,
-            output_dir=args.dof_output_dir,
-            start=max(int(args.dof_start), 0),
-            limit=(int(args.dof_limit) if int(args.dof_limit) > 0 else None),
-            voxel_size=float(args.voxel_size),
-            use_coarse_fine=True,
-            enable_pcd_fit=bool(args.pcd_fit),
-            enable_lightglue_init=bool(args.lightglue_init),
-            enable_tapir_init=bool(args.tapir_init),
-            init_candidate_mode=init_candidate_mode,
-            tapir_cfg=tapir_cfg,
-            use_trimmed_mask=bool(args.dof_use_trimmed_mask),
-            export_artifacts=not bool(args.dof_no_export_artifacts),
-        )
-        print(
-            f"DOF batch done: ok={summary['ok']} failed={summary['failed']} "
-            f"total={summary['total']} output={summary['output_dir']}"
-        )
-        print(f"CSV: {summary['csv_path']}")
-    elif args.local or args.browse:
-        browser = _StereoNetBrowser(
-            data_dir=args.data_dir,
-            object_name=args.object_name,
-            enable_lightglue_init=args.lightglue_init,
-            enable_tapir_init=args.tapir_init,
-            init_candidate_mode=init_candidate_mode,
-            tapir_cfg=tapir_cfg,
-        )
-        browser.run()
-    elif args.local_files:
-        launcher = _LocalLauncher(init_candidate_mode=init_candidate_mode, tapir_cfg=tapir_cfg)
-        launcher.run()
-    else:
-        app = build_app()
-        app.launch(
-            server_name=args.host, server_port=args.port,
-            share=args.share, css=CUSTOM_CSS,
-        )
+
+if __name__ == "__main__":
+    main()
