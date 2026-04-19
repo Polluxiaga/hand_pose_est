@@ -1695,6 +1695,7 @@ def run_reestimation(
         f"inliers={(tapir_result.debug or {}).get('inlier_count', 0)}",
     )
 
+    t_reg_prep = time.perf_counter()
     seed_candidates, seed_debug = _build_seed_candidates(before, after, tapir_result, tapir_result.debug)
     if not seed_candidates:
         reason = tapir_result.debug.get("reason") or tapir_result.debug.get("error") or "no valid init seed"
@@ -1780,6 +1781,9 @@ def run_reestimation(
                 f"{fallback_prefilter_debug.get('input_candidate_count', 0)} "
                 f"tags={fallback_prefilter_debug.get('selected_tags', [])[:8]}",
             )
+
+    stage_timings["registration / prep"] = time.perf_counter() - t_reg_prep
+    _emit_runtime_log(log_fn, f"registration/prep done {stage_timings['registration / prep'] * 1000.0:.1f} ms")
 
     best_result: dict[str, Any] | None = None
     candidate_ranking: list[dict[str, Any]] = []
@@ -1896,7 +1900,12 @@ def run_reestimation(
                 f"rmse_drop={float(prior_compare_debug.get('rmse_drop_m', 0.0)):.4f}",
             )
     stage_timings["registration / refine"] = time.perf_counter() - t_stage
+    stage_timings["registration / total"] = (
+        float(stage_timings.get("registration / prep", 0.0))
+        + float(stage_timings["registration / refine"])
+    )
     _emit_runtime_log(log_fn, f"registration/refine done {stage_timings['registration / refine'] * 1000.0:.1f} ms")
+    _emit_runtime_log(log_fn, f"registration/total done {stage_timings['registration / total'] * 1000.0:.1f} ms")
 
     assert best_result is not None
     T_registration = np.asarray(best_result["T_registration"], dtype=np.float64).reshape(4, 4)
@@ -2228,7 +2237,9 @@ def _write_pair_outputs(
                 "tapir_prior_no_rpc_io": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_rpc_io", 0.0)) * 1000.0))),
                 "tapir_prior_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / remote_roundtrip", 0.0)) * 1000.0))),
                 "tapir_prior_rpc_io_overhead": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / rpc_io_overhead", 0.0)) * 1000.0))),
-                "registration": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / refine", 0.0)) * 1000.0))),
+                "registration": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / total", 0.0)) * 1000.0))),
+                "registration_prep": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / prep", 0.0)) * 1000.0))),
+                "registration_refine": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / refine", 0.0)) * 1000.0))),
                 "total": int(round(float(result.elapsed_s) * 1000.0)),
             }
         },
