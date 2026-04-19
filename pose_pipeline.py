@@ -496,9 +496,44 @@ def _draw_registration_overlay(after_rgb: np.ndarray, after_mask: np.ndarray, al
         largest = max(contours, key=cv2.contourArea)
         cv2.drawContours(right, [largest], -1, (76, 175, 255), 2, cv2.LINE_AA)
     cv2.putText(left, "After target mask", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
-    cv2.putText(right, "After + TAPIR aligned projection", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
+    cv2.putText(right, "After + aligned projection", (14, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 230, 210), 2, cv2.LINE_AA)
     divider = np.full((after_rgb.shape[0], 10, 3), 18, dtype=np.uint8)
     return np.concatenate([left, divider, right], axis=1)
+
+
+def _resize_rgb_to_height(image_rgb: np.ndarray, target_height: int) -> np.ndarray:
+    image_rgb = np.asarray(image_rgb, dtype=np.uint8)
+    height, width = image_rgb.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("Image must be non-empty.")
+    if height == target_height:
+        return image_rgb.copy()
+    scale = float(target_height) / float(height)
+    target_width = max(1, int(round(width * scale)))
+    return cv2.resize(image_rgb, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+
+
+def _prepend_reference_panel_rgb(
+    reference_rgb: np.ndarray,
+    overlay_rgb: np.ndarray,
+    gap_px: int = 8,
+    background_rgb: tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    target_height = max(int(reference_rgb.shape[0]), int(overlay_rgb.shape[0]))
+    panels = [
+        _resize_rgb_to_height(reference_rgb, target_height),
+        _resize_rgb_to_height(overlay_rgb, target_height),
+    ]
+    total_width = sum(int(panel.shape[1]) for panel in panels) + max(0, int(gap_px))
+    canvas = np.full((target_height, total_width, 3), background_rgb, dtype=np.uint8)
+    x = 0
+    for index, panel in enumerate(panels):
+        width = int(panel.shape[1])
+        canvas[:, x:x + width] = panel
+        x += width
+        if index == 0:
+            x += max(0, int(gap_px))
+    return canvas
 
 
 def _rigid_inverse(T: np.ndarray) -> np.ndarray:
@@ -2101,6 +2136,7 @@ def _write_pair_outputs(
         "left_replay_object_overlay_no_trim_tapir_*.png",
         "tapir_correspondence_overlay_*.png",
         "left_replay_object_tapir_prior_overlay_*.png",
+        "left_replay_triptych_*.png",
     ):
         for stale_path in save_dir.glob(stale_pattern):
             if stale_path.is_file():
@@ -2116,7 +2152,8 @@ def _write_pair_outputs(
     o3d.io.write_point_cloud(str(save_dir / "reference_object_transformed_colored.ply"), aligned)
 
     overlay = _draw_registration_overlay(after["rgb"], after["mask"], aligned, after["K"])
-    cv2.imwrite(str(save_dir / "left_replay_overlay.png"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    overlay_with_reference = _prepend_reference_panel_rgb(before["rgb"], overlay)
+    cv2.imwrite(str(save_dir / "left_replay_overlay.png"), cv2.cvtColor(overlay_with_reference, cv2.COLOR_RGB2BGR))
 
     tapir_raw = result.debug.get("_tapir_init_raw")
     if tapir_raw is not None:
@@ -2134,9 +2171,10 @@ def _write_pair_outputs(
             tapir_aligned.transform(tapir_T)
             tapir_overlay = _draw_registration_overlay(after["rgb"], after["mask"], tapir_aligned, after["K"])
             if requested_points > 0:
+                tapir_overlay_with_reference = _prepend_reference_panel_rgb(before["rgb"], tapir_overlay)
                 cv2.imwrite(
                     str(save_dir / f"left_replay_object_tapir_prior_overlay_{mode}_{requested_points}.png"),
-                    cv2.cvtColor(tapir_overlay, cv2.COLOR_RGB2BGR),
+                    cv2.cvtColor(tapir_overlay_with_reference, cv2.COLOR_RGB2BGR),
                 )
 
     ref_mask = np.asarray(before["mask"]) > 0
@@ -2147,8 +2185,7 @@ def _write_pair_outputs(
         object_crop = before["rgb"][y0:y1, x0:x1]
     else:
         object_crop = before["rgb"]
-    cv2.imwrite(str(save_dir / "memory_reference_left.png"), cv2.cvtColor(before["rgb"], cv2.COLOR_RGB2BGR))
-    cv2.imwrite(str(save_dir / "memory_reference_object.png"), cv2.cvtColor(object_crop, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(save_dir / "object.png"), cv2.cvtColor(object_crop, cv2.COLOR_RGB2BGR))
 
     registration_summary = dict(result.debug.get("registration_summary") or {})
     registration_summary.setdefault("downsample_debug", {"reference": before_downsample, "current": after_downsample})
@@ -2167,20 +2204,6 @@ def _write_pair_outputs(
     }
     with open(save_dir / "tapir_prior_debug.json", "w", encoding="utf-8") as handle:
         json.dump(tapir_prior_payload, handle, indent=2, default=str)
-
-    memory_reference_payload = {
-        "memory_dir": pair.get("memory_dir", ""),
-        "request_id": before.get("request", {}).get("request_id") or before["artifact_dir"].name,
-        "reference_points": int(before.get("object_points", 0) or len(np.asarray(before.get("object_xyz", [])))),
-        "gripper_variant_names": [
-            str(item.get("name"))
-            for item in ((before.get("response", {}).get("gripper", {}) or {}).get("variants") or [])
-            if isinstance(item, dict) and item.get("name")
-        ],
-        "experiment_config": after.get("experiment_config", {}) or {},
-    }
-    with open(save_dir / "memory_reference.json", "w", encoding="utf-8") as handle:
-        json.dump(memory_reference_payload, handle, indent=2, default=str)
 
     result_payload = {
         "case": {
