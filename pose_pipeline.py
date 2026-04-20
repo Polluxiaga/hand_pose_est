@@ -21,6 +21,14 @@ except ImportError:
     o3d = None  # type: ignore[assignment]
 
 from match_geometry_core import projected_uv_to_mask
+from init_seed_core import (
+    SeedCandidate,
+    build_sam3d_seed_candidates as _build_sam3d_seed_candidates,
+    build_tapir_seed_candidates as _build_seed_candidates,
+    prior_keep_debug as _prior_keep_debug,
+    reconstruct_init_transform as _reconstruct_tapir_transform,
+    registration_working_target_points as _registration_working_target_points,
+)
 from pcd_registration_core import (
     CameraIntrinsics,
     RegistrationConfig,
@@ -34,6 +42,13 @@ from tapir_match_core import (
     TapirMatchConfig,
     draw_tapir_matches,
     estimate_tapir_init_transform,
+)
+from sam3d_match_core import (
+    DEFAULT_SAM3D_PICK_PROMPT,
+    DEFAULT_SAM3D_URL,
+    Sam3dMatchConfig,
+    estimate_sam3d_init_transform,
+    evaluate_sam3d_prior,
 )
 
 DEFAULT_DOF_MATCH_DIR = "dof_match"
@@ -50,15 +65,6 @@ class ReEstimationResult:
     T_slip: np.ndarray
     debug: dict[str, Any] = field(default_factory=dict)
     elapsed_s: float = 0.0
-
-
-@dataclass
-class SeedCandidate:
-    tag: str
-    T_init: np.ndarray
-    score_hint: float = 0.0
-    search_mode: str = "full"
-    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def _emit_runtime_log(log_fn, message: str) -> None:
@@ -178,6 +184,44 @@ def _load_dof_intrinsics(artifact_dir: Path) -> dict[str, float]:
         "width": float(values.get("width", 0.0)),
         "height": float(values.get("height", 0.0)),
     }
+
+
+def _load_dof_extrinsics(artifact_dir: Path, request_data: dict[str, Any]) -> dict[str, Any]:
+    path = artifact_dir / "extrinsics.json"
+    data: dict[str, Any] = {}
+    if path.is_file():
+        data = _read_json_file(path)
+    elif isinstance(request_data.get("extrinsics"), dict):
+        data = dict(request_data.get("extrinsics") or {})
+    if "rotation" not in data or "shift" not in data:
+        return {}
+    rotation = np.asarray(data.get("rotation"), dtype=np.float64)
+    shift = np.asarray(data.get("shift"), dtype=np.float64)
+    if rotation.shape != (3, 3) or shift.shape != (3,):
+        return {}
+    if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(shift)):
+        return {}
+    return {
+        "rotation": rotation.astype(np.float32, copy=False),
+        "shift": shift.astype(np.float32, copy=False),
+    }
+
+
+def _load_dof_object_prompt(artifact_dir: Path, is_replay: bool, request_data: dict[str, Any]) -> str:
+    request_prompt = str(request_data.get("object_prompt") or "").strip()
+    if request_prompt:
+        return request_prompt
+    seg_name = "current_object_segment.json" if is_replay else "object_segment.json"
+    seg_data = _load_json_if_present(artifact_dir / seg_name)
+    prompt = str(seg_data.get("prompt") or "").strip()
+    if prompt:
+        return prompt
+    qwen_debug = seg_data.get("qwen_debug") or {}
+    if isinstance(qwen_debug, dict):
+        prompt = str(qwen_debug.get("prompt") or "").strip()
+        if prompt:
+            return prompt
+    return DEFAULT_SAM3D_PICK_PROMPT
 
 
 def _mask_from_pixels(pixel_path: Path, height: int, width: int) -> np.ndarray:
@@ -306,6 +350,21 @@ def _build_pointcloud_from_cached(sample: dict[str, Any]) -> Any:
     return pcd
 
 
+def _build_pointcloud_from_arrays(points_xyz: np.ndarray, points_rgb: np.ndarray | None = None) -> Any:
+    if o3d is None:
+        raise RuntimeError("open3d is required")
+    points = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+    pcd = o3d.geometry.PointCloud()
+    if len(points) == 0:
+        return pcd
+    pcd.points = o3d.utility.Vector3dVector(points)
+    if points_rgb is not None:
+        colors = np.asarray(points_rgb, dtype=np.float64).reshape(-1, 3)
+        if len(colors) == len(points):
+            pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
+    return pcd
+
+
 def _prepare_registration_pcd(sample: dict[str, Any], cfg: RegistrationConfig) -> tuple[Any, dict[str, Any]]:
     object_xyz = np.asarray(sample.get("object_xyz", np.zeros((0, 3), dtype=np.float32)))
     object_rgb = np.asarray(sample.get("object_rgb", np.zeros((0, 3), dtype=np.float32)))
@@ -336,6 +395,43 @@ def _reestimate_pcd_normals(pcd: Any, cfg: RegistrationConfig) -> Any:
     )
     pcd.normalize_normals()
     return pcd
+
+
+def _bbox_xyxy_from_mask(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    mask_bool = np.asarray(mask) > 0
+    if mask_bool.ndim == 3:
+        mask_bool = mask_bool[:, :, 0]
+    ys, xs = np.nonzero(mask_bool)
+    if len(xs) == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def _clip_xyxy(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1 = max(0, min(x1, width - 1))
+    x2 = max(0, min(x2, width - 1))
+    y1 = max(0, min(y1, height - 1))
+    y2 = max(0, min(y2, height - 1))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    return x1, y1, x2, y2
+
+
+def _crop_rgb_mask_dense(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    dense_map_cam: np.ndarray,
+    bbox_xyxy: tuple[int, int, int, int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x1, y1, x2, y2 = _clip_xyxy(tuple(int(v) for v in bbox_xyxy), int(rgb.shape[1]), int(rgb.shape[0]))
+    return (
+        np.asarray(rgb[y1 : y2 + 1, x1 : x2 + 1], dtype=np.uint8).copy(),
+        np.asarray(mask[y1 : y2 + 1, x1 : x2 + 1]).copy(),
+        np.asarray(dense_map_cam[y1 : y2 + 1, x1 : x2 + 1], dtype=np.float32).copy(),
+    )
 
 
 def _cap_registration_working_pcd(
@@ -416,11 +512,14 @@ def _load_dof_artifact_sample(artifact_dir: Path, is_replay: bool) -> dict[str, 
         raise ValueError(f"Failed to read image: {image_path}")
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     height, width = image_rgb.shape[:2]
-    depth = depth_to_meters(np.load(str(depth_path)), target_hw=(height, width))
+    dense_raw = np.load(str(depth_path))
+    depth = depth_to_meters(dense_raw, target_hw=(height, width))
     mask = _load_dof_mask(artifact_dir, height, width, is_replay=is_replay)
     intr = _load_dof_intrinsics(artifact_dir)
     request_data = _load_json_if_present(artifact_dir / "request.json")
     response_data = _load_json_if_present(artifact_dir / "response.json")
+    extrinsics = _load_dof_extrinsics(artifact_dir, request_data)
+    object_prompt = _load_dof_object_prompt(artifact_dir, is_replay=is_replay, request_data=request_data)
     experiment_config = _load_json_if_present(artifact_dir / "replay_experiment_config.json")
     cached_arrays = _load_cached_object_arrays(artifact_dir, is_replay=is_replay)
     object_obb = _load_reference_obb(artifact_dir, response_data, cached_arrays) if not is_replay else {}
@@ -437,10 +536,13 @@ def _load_dof_artifact_sample(artifact_dir: Path, is_replay: bool) -> dict[str, 
         "artifact_dir": artifact_dir,
         "rgb": image_rgb,
         "depth": depth,
+        "dense_raw": np.asarray(dense_raw, dtype=np.float32),
         "mask": mask,
         "K": camera_intr,
         "request": request_data,
         "response": response_data,
+        "extrinsics": extrinsics,
+        "object_prompt": object_prompt,
         "experiment_config": experiment_config,
         "object_xyz": np.asarray(cached_arrays.get("point_xyz", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32),
         "object_rgb": np.asarray(cached_arrays.get("point_rgb", np.zeros((0, 3), dtype=np.float32)), dtype=np.float32),
@@ -556,323 +658,6 @@ def _rotation_angle_deg(R: np.ndarray) -> float:
     rot = np.asarray(R, dtype=np.float64).reshape(3, 3)
     val = np.clip((np.trace(rot) - 1.0) * 0.5, -1.0, 1.0)
     return float(np.degrees(np.arccos(val)))
-
-
-def _transform_from_axes(ref_axes: np.ndarray, ref_center: np.ndarray, cur_axes: np.ndarray, cur_center: np.ndarray) -> np.ndarray:
-    R = np.asarray(cur_axes, dtype=np.float64).reshape(3, 3) @ np.asarray(ref_axes, dtype=np.float64).reshape(3, 3).T
-    t = np.asarray(cur_center, dtype=np.float64).reshape(3) - (R @ np.asarray(ref_center, dtype=np.float64).reshape(3))
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = R
-    T[:3, 3] = t
-    return T
-
-
-def _compute_current_pca_obb(sample: dict[str, Any]) -> dict[str, Any]:
-    points = np.asarray(sample.get("object_xyz", np.zeros((0, 3), dtype=np.float32)), dtype=np.float64)
-    axes, center = _compute_axes_from_points(points)
-    return {
-        "axes": axes,
-        "center_m": center,
-    }
-
-
-def _build_axis_permutation_candidates(ref_obb: dict[str, Any], cur_obb: dict[str, Any]) -> list[SeedCandidate]:
-    ref_axes = np.asarray(ref_obb.get("axes", np.eye(3)), dtype=np.float64).reshape(3, 3)
-    ref_center = np.asarray(ref_obb.get("center_m", np.zeros(3)), dtype=np.float64).reshape(3)
-    cur_axes = np.asarray(cur_obb.get("axes", np.eye(3)), dtype=np.float64).reshape(3, 3)
-    cur_center = np.asarray(cur_obb.get("center_m", np.zeros(3)), dtype=np.float64).reshape(3)
-    candidates: list[SeedCandidate] = []
-    seen: list[np.ndarray] = []
-    basis = np.eye(3, dtype=np.float64)
-    for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)):
-        P = basis[:, perm]
-        for sx in (-1.0, 1.0):
-            for sy in (-1.0, 1.0):
-                S = np.diag([sx, sy, 1.0])
-                cand_axes = cur_axes @ P @ S
-                if np.linalg.det(cand_axes) < 0.0:
-                    cand_axes[:, -1] *= -1.0
-                T = _transform_from_axes(ref_axes, ref_center, cand_axes, cur_center)
-                R = T[:3, :3]
-                duplicate = any(np.allclose(R, prev, atol=1e-6) for prev in seen)
-                if duplicate:
-                    continue
-                seen.append(R.copy())
-                candidates.append(
-                    SeedCandidate(
-                        tag="pca_perm",
-                        T_init=T,
-                        score_hint=0.02,
-                        search_mode="fallback_light",
-                        metadata={
-                            "perm": list(perm),
-                            "sign_x": sx,
-                            "sign_y": sy,
-                        },
-                    )
-                )
-    return candidates
-
-
-def _reconstruct_tapir_transform(result: Any) -> np.ndarray | None:
-    if result is None:
-        return None
-    T = getattr(result, "T_before_cam_to_after_cam", None)
-    if T is not None:
-        return np.asarray(T, dtype=np.float64).reshape(4, 4)
-    debug = getattr(result, "debug", {}) or {}
-    rot = debug.get("prior_rotation")
-    trans = debug.get("prior_translation")
-    if rot is None or trans is None:
-        return None
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = np.asarray(rot, dtype=np.float64).reshape(3, 3)
-    T[:3, 3] = np.asarray(trans, dtype=np.float64).reshape(3)
-    return T
-
-
-def _rotation_delta_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
-    R_rel = np.asarray(R_a, dtype=np.float64).reshape(3, 3) @ np.asarray(R_b, dtype=np.float64).reshape(3, 3).T
-    trace = float(np.trace(R_rel))
-    cos_theta = np.clip((trace - 1.0) * 0.5, -1.0, 1.0)
-    return float(np.degrees(np.arccos(cos_theta)))
-
-
-def _seed_rank_score(candidate: SeedCandidate, reference_T: np.ndarray | None) -> float:
-    T = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
-    if reference_T is None:
-        rot_score = _rotation_delta_deg(T[:3, :3], np.eye(3, dtype=np.float64))
-        trans_score = float(np.linalg.norm(T[:3, 3]))
-    else:
-        ref_T = np.asarray(reference_T, dtype=np.float64).reshape(4, 4)
-        rot_score = _rotation_delta_deg(T[:3, :3], ref_T[:3, :3])
-        trans_score = float(np.linalg.norm(T[:3, 3] - ref_T[:3, 3]))
-    return float(rot_score + trans_score * 1000.0)
-
-
-def _candidate_signature(candidate: SeedCandidate) -> tuple[float, ...]:
-    T = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
-    mode_signature = float(sum(ord(ch) for ch in str(candidate.search_mode or "")))
-    return tuple(np.round(np.concatenate([[mode_signature], T[:3, :3].reshape(-1), T[:3, 3]]), 4).tolist())
-
-
-def _append_unique_seed(candidates: list[SeedCandidate], candidate: SeedCandidate | None, seen: set[tuple[float, ...]]) -> bool:
-    if candidate is None:
-        return False
-    signature = _candidate_signature(candidate)
-    if signature in seen:
-        return False
-    seen.add(signature)
-    candidates.append(candidate)
-    return True
-
-
-def _take_ranked_candidates(
-    base_candidates: list[SeedCandidate],
-    limit: int,
-    reference_T: np.ndarray | None,
-) -> list[SeedCandidate]:
-    if limit <= 0:
-        return []
-    ranked = sorted(base_candidates, key=lambda candidate: (_seed_rank_score(candidate, reference_T), candidate.tag))
-    return ranked[:limit]
-
-
-def _build_fallback_seed_candidates(
-    ref_obb: dict[str, Any],
-    cur_obb: dict[str, Any],
-    reference_T: np.ndarray | None,
-    candidate_limit: int = 16,
-) -> tuple[list[SeedCandidate], dict[str, int]]:
-    raw_pca_candidates = _build_axis_permutation_candidates(ref_obb, cur_obb)
-    selected_pca_candidates = _take_ranked_candidates(
-        raw_pca_candidates,
-        limit=int(candidate_limit),
-        reference_T=reference_T,
-    )
-    return selected_pca_candidates, {
-        "pca_candidate_count": int(len(raw_pca_candidates)),
-        "pca_candidates_used": int(len(selected_pca_candidates)),
-    }
-
-
-def _build_tapir_prior_keep_candidate(tapir_T: np.ndarray, tapir_debug: dict[str, Any]) -> SeedCandidate:
-    return SeedCandidate(
-        tag="tapir_prior_keep",
-        T_init=np.asarray(tapir_T, dtype=np.float64).reshape(4, 4),
-        score_hint=-0.24,
-        search_mode="tapir_prior_keep",
-        metadata={
-            "prior_dense_rmse_eval": float((tapir_debug or {}).get("prior_dense_rmse_eval", math.inf)),
-            "prior_dense_fitness_eval": float((tapir_debug or {}).get("prior_dense_fitness_eval", 0.0)),
-            "prior_proj_iou": float((tapir_debug or {}).get("prior_proj_iou", 0.0)),
-            "prior_proj_precision": float((tapir_debug or {}).get("prior_proj_precision", 0.0)),
-        },
-    )
-
-
-def _tapir_compare_refine_search_mode(tapir_debug: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
-    proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0) or 0.0)
-    proj_precision = float((tapir_debug or {}).get("prior_proj_precision", 0.0) or 0.0)
-    rel_dense_rmse = float((tapir_debug or {}).get("prior_dense_relative_rmse_eval", math.inf) or math.inf)
-
-    verify_ready = bool(
-        prior_confidence >= 0.56
-        and proj_iou >= 0.45
-        and proj_precision >= 0.60
-        and np.isfinite(rel_dense_rmse)
-        and rel_dense_rmse <= 0.065
-    )
-    if verify_ready:
-        return "tapir_micro_verify_strict", {
-            "compare_refine_mode": "micro_verify_strict",
-            "compare_refine_reason": "high_medium_confidence_prior_direct_gicp_verify",
-        }
-    return "tapir_micro_verify_relaxed", {
-        "compare_refine_mode": "micro_verify_relaxed",
-        "compare_refine_reason": "default_medium_band_direct_gicp_verify",
-    }
-
-
-def _tapir_compare_entry_decision(tapir_debug: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
-    prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
-    proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0) or 0.0)
-    proj_precision = float((tapir_debug or {}).get("prior_proj_precision", 0.0) or 0.0)
-    rel_dense_rmse = float((tapir_debug or {}).get("prior_dense_relative_rmse_eval", math.inf) or math.inf)
-    inliers = int((tapir_debug or {}).get("num_inliers", (tapir_debug or {}).get("inlier_count", 0)) or 0)
-
-    compare_verify_confidence_thresh = 0.56
-    low_inlier_thresh = 4
-    low_proj_iou_thresh = 0.36
-    low_proj_precision_thresh = 0.52
-    weak_projection_support = bool(
-        proj_iou < low_proj_iou_thresh
-        and proj_precision < low_proj_precision_thresh
-    )
-    weak_medium_prior = bool(
-        prior_confidence < compare_verify_confidence_thresh
-        and inliers <= low_inlier_thresh
-        and weak_projection_support
-    )
-    return (not weak_medium_prior), {
-        "compare_entry_gate_ok": bool(not weak_medium_prior),
-        "compare_entry_reason": (
-            "weak_medium_prior_low_projection_support" if weak_medium_prior else "tapir_compare_allowed"
-        ),
-        "compare_entry_verify_confidence_thresh": float(compare_verify_confidence_thresh),
-        "compare_entry_low_inlier_thresh": int(low_inlier_thresh),
-        "compare_entry_low_proj_iou_thresh": float(low_proj_iou_thresh),
-        "compare_entry_low_proj_precision_thresh": float(low_proj_precision_thresh),
-        "compare_entry_prior_confidence": float(prior_confidence),
-        "compare_entry_proj_iou": float(proj_iou),
-        "compare_entry_proj_precision": float(proj_precision),
-        "compare_entry_rel_dense_rmse": float(rel_dense_rmse),
-        "compare_entry_inliers": int(inliers),
-    }
-
-
-def _tapir_prior_keep_debug(candidate: SeedCandidate) -> dict[str, Any]:
-    metadata = candidate.metadata or {}
-    prior_rmse = float(metadata.get("prior_dense_rmse_eval", math.inf))
-    prior_fitness = float(metadata.get("prior_dense_fitness_eval", 0.0))
-    prior_proj_iou = float(metadata.get("prior_proj_iou", 0.0))
-    return {
-        "search_mode": "tapir_prior_keep",
-        "coarse_score": float("nan"),
-        "coarse_ms": 0,
-        "coarse_skipped": True,
-        "fine_score": float("nan"),
-        "fine_ms": 0,
-        "gicp_fitness": prior_fitness,
-        "gicp_inlier_rmse": prior_rmse,
-        "gicp_visibility_score": 0.0,
-        "gicp_projection_iou": prior_proj_iou,
-        "gicp_ms": 0,
-        "colored_icp_disabled": True,
-        "colored_icp_rejected": True,
-        "colored_icp_reject_reasons": ["tapir_prior_keep"],
-        "colored_icp_effective_source": "tapir_prior_keep",
-        "colored_icp_fitness": prior_fitness,
-        "colored_icp_inlier_rmse": prior_rmse,
-        "colored_icp_ms": 0,
-        "total_reg_ms": 0,
-    }
-
-
-def _build_seed_candidates(before: dict[str, Any], after: dict[str, Any], tapir_raw: Any, tapir_debug: dict[str, Any]) -> tuple[list[SeedCandidate], dict[str, Any]]:
-    candidates: list[SeedCandidate] = []
-    seed_debug: dict[str, Any] = {}
-    seen: set[tuple[float, ...]] = set()
-    tapir_T = _reconstruct_tapir_transform(tapir_raw)
-    tapir_gate_ok = bool((tapir_debug or {}).get("prior_gate_decision", False))
-    tapir_strong_ok = bool((tapir_debug or {}).get("prior_gate_strong_3d_ok", False))
-    tapir_borderline_ok = bool((tapir_debug or {}).get("prior_gate_borderline_override", False))
-    tapir_compare_search_mode, tapir_compare_mode_debug = _tapir_compare_refine_search_mode(tapir_debug or {})
-    tapir_compare_entry_ok, tapir_compare_entry_debug = _tapir_compare_entry_decision(tapir_debug or {})
-    tapir_seed = None
-    if tapir_T is not None:
-        tapir_seed = SeedCandidate(
-            tag="tapir_prior_local_refine",
-            T_init=tapir_T,
-            score_hint=(-0.20 if tapir_strong_ok else (-0.08 if tapir_gate_ok else 0.18)),
-            search_mode=tapir_compare_search_mode,
-            metadata=dict(tapir_compare_mode_debug),
-        )
-
-    ref_obb = before.get("object_obb") or _compute_current_pca_obb(before)
-    cur_obb = after.get("object_obb") or _compute_current_pca_obb(after)
-    fallback_candidates, fallback_seed_stats = _build_fallback_seed_candidates(ref_obb, cur_obb, tapir_T)
-    tapir_proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0))
-    tapir_inliers = int((tapir_debug or {}).get("num_inliers", (tapir_debug or {}).get("inlier_count", 0)) or 0)
-    prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
-    prior_confidence_accept = float((tapir_debug or {}).get("prior_confidence_accept_thresh", 0.0) or 0.0)
-    prior_confidence_strong = float((tapir_debug or {}).get("prior_confidence_strong_thresh", 1.0) or 1.0)
-    confidence_tier = "fallback"
-    compare_entry_routed_to_fallback = bool(
-        tapir_T is not None
-        and tapir_gate_ok
-        and tapir_seed is not None
-        and not tapir_strong_ok
-        and not tapir_compare_entry_ok
-    )
-
-    seed_policy = "fallback_search"
-    if tapir_T is not None and tapir_strong_ok:
-        seed_policy = "tapir_prior_direct"
-        confidence_tier = "strong"
-        _append_unique_seed(candidates, _build_tapir_prior_keep_candidate(tapir_T, tapir_debug), seen)
-    elif tapir_T is not None and tapir_gate_ok and tapir_seed is not None and tapir_compare_entry_ok:
-        seed_policy = "tapir_prior_compare"
-        confidence_tier = "borderline" if tapir_borderline_ok and prior_confidence < prior_confidence_accept else "medium"
-        _append_unique_seed(candidates, _build_tapir_prior_keep_candidate(tapir_T, tapir_debug), seen)
-        _append_unique_seed(candidates, tapir_seed, seen)
-    else:
-        if compare_entry_routed_to_fallback:
-            confidence_tier = "medium_routed_fallback"
-        for candidate in fallback_candidates:
-            _append_unique_seed(candidates, candidate, seen)
-    seed_debug.update(
-        {
-            "seed_policy": seed_policy,
-            "candidate_ranking_topk": [],
-            **fallback_seed_stats,
-            "tapir_gate_ok": tapir_gate_ok,
-            "tapir_strong_ok": tapir_strong_ok,
-            "tapir_borderline_ok": tapir_borderline_ok,
-            "tapir_proj_iou": tapir_proj_iou,
-            "tapir_inliers": tapir_inliers,
-            **tapir_compare_mode_debug,
-            **tapir_compare_entry_debug,
-            "compare_entry_routed_to_fallback": bool(compare_entry_routed_to_fallback),
-            "tapir_prior_confidence": float(prior_confidence),
-            "tapir_prior_confidence_accept_thresh": float(prior_confidence_accept),
-            "tapir_prior_confidence_strong_thresh": float(prior_confidence_strong),
-            "tapir_prior_confidence_tier": confidence_tier,
-        }
-    )
-    return candidates, seed_debug
-
 
 def _projection_metrics(points_ref: np.ndarray, T_ref_to_cur: np.ndarray, cur_mask: np.ndarray, intr: CameraIntrinsics) -> dict[str, Any]:
     uv = _project_points_to_image(_transform_points(points_ref, T_ref_to_cur), intr, cur_mask.shape[:2])
@@ -1047,7 +832,7 @@ def _prior_compare_keep_decision(
     prior_candidate = prior_result.get("candidate")
     if not isinstance(best_candidate, SeedCandidate) or not isinstance(prior_candidate, SeedCandidate):
         return False, debug
-    if str(best_candidate.tag) == "tapir_prior_keep":
+    if str(best_candidate.tag) in {"tapir_prior_keep", "sam3d_prior_keep"}:
         return False, debug
 
     best_proj = dict(best_result.get("proj_metrics") or {})
@@ -1317,6 +1102,8 @@ def coarse_fine_registration(
         "tapir_local_verify",
         "tapir_micro_verify_strict",
         "tapir_micro_verify_relaxed",
+        "sam3d_micro_verify_strict",
+        "sam3d_micro_verify_relaxed",
         "fallback_light",
     }:
         T_coarse = np.asarray(T_init, dtype=np.float64).reshape(4, 4)
@@ -1348,7 +1135,7 @@ def coarse_fine_registration(
         debug["coarse_ms"] = int(round((time.perf_counter() - t0) * 1000.0))
 
     t1 = time.perf_counter()
-    if search_mode == "tapir_micro_verify_strict":
+    if search_mode in {"tapir_micro_verify_strict", "sam3d_micro_verify_strict"}:
         T_search = T_coarse
         fine_info = {"score": math.nan, "skipped": True}
         debug["fine_score"] = float("nan")
@@ -1360,7 +1147,7 @@ def coarse_fine_registration(
             use_colored_icp=False,
             colored_icp_max_iter=0,
         )
-    elif search_mode == "tapir_micro_verify_relaxed":
+    elif search_mode in {"tapir_micro_verify_relaxed", "sam3d_micro_verify_relaxed"}:
         T_search = T_coarse
         fine_info = {"score": math.nan, "skipped": True}
         debug["fine_score"] = float("nan")
@@ -1427,7 +1214,12 @@ def coarse_fine_registration(
             search_ty_m=(-0.004, 0.0, 0.004),
             search_tz_m=(-0.004, 0.0, 0.004),
         )
-    if search_mode not in {"tapir_micro_verify_strict", "tapir_micro_verify_relaxed"}:
+    if search_mode not in {
+        "tapir_micro_verify_strict",
+        "tapir_micro_verify_relaxed",
+        "sam3d_micro_verify_strict",
+        "sam3d_micro_verify_relaxed",
+    }:
         T_search, fine_info = local_hypothesis_search(
             src_head_pcd_base=src_pcd,
             tgt_pcd_base=tgt_pcd,
@@ -1650,21 +1442,28 @@ def assess_quality(
 def run_reestimation(
     before: dict[str, Any],
     after: dict[str, Any],
-    tapir_cfg: TapirMatchConfig,
+    tapir_cfg: TapirMatchConfig | None = None,
+    sam3d_cfg: Sam3dMatchConfig | None = None,
     cfg: RegistrationConfig | None = None,
     log_fn=None,
+    init_method: str = "tapir",
 ) -> ReEstimationResult:
     if o3d is None:
         raise RuntimeError("open3d is required")
     cfg = cfg or RegistrationConfig()
+    init_method_norm = str(init_method or "tapir").strip().lower()
+    if init_method_norm not in {"tapir", "sam3d"}:
+        raise ValueError(f"Unsupported init_method: {init_method}")
 
     t_total = time.perf_counter()
     debug: dict[str, Any] = {
         "mode": "camera",
-        "init_candidate_mode": "tapir",
+        "init_candidate_mode": init_method_norm,
         "candidate_inits": [],
         "best_init": "",
-        "tapir_init_enabled": True,
+        "tapir_init_enabled": bool(init_method_norm == "tapir"),
+        "sam3d_init_enabled": bool(init_method_norm == "sam3d"),
+        "init_method": init_method_norm,
     }
     stage_timings: dict[str, float] = {}
 
@@ -1688,53 +1487,123 @@ def run_reestimation(
     }
 
     t_stage = time.perf_counter()
-    _emit_runtime_log(log_fn, "tapir/init start")
-    tapir_result = estimate_tapir_init_transform(
-        before_rgb=before["rgb"],
-        before_depth_m=before["depth"],
-        before_mask=before["mask"],
-        after_rgb=after["rgb"],
-        after_depth_m=after["depth"],
-        after_mask=after["mask"],
-        intr=before["K"],
-        cfg=tapir_cfg,
-    )
-    debug["tapir_init"] = tapir_result.debug
-    debug["_tapir_init_raw"] = tapir_result
-    stage_timings["tapir / init"] = time.perf_counter() - t_stage
-    tapir_debug = tapir_result.debug or {}
-    tapir_timings = tapir_debug.get("timings_s") or {}
-    track_e2e_s = float(tapir_timings.get("track", 0.0) or 0.0)
-    track_remote_roundtrip_s = float(tapir_timings.get("track_remote_roundtrip", track_e2e_s) or track_e2e_s)
-    stage_timings["tapir / init no_remote_roundtrip"] = max(
-        0.0,
-        float(stage_timings["tapir / init"]) - track_remote_roundtrip_s,
-    )
-    stage_timings["tapir / remote_roundtrip"] = max(
-        0.0,
-        float(stage_timings["tapir / init"]) - float(stage_timings["tapir / init no_remote_roundtrip"]),
-    )
-    track_no_rpc_io_s = float(tapir_timings.get("track_no_rpc_io", track_e2e_s) or track_e2e_s)
-    stage_timings["tapir / init no_rpc_io"] = max(
-        0.0,
-        float(stage_timings["tapir / init"]) - track_e2e_s + track_no_rpc_io_s,
-    )
-    stage_timings["tapir / rpc_io_overhead"] = max(
-        0.0,
-        float(stage_timings["tapir / init"]) - float(stage_timings["tapir / init no_rpc_io"]),
-    )
+    init_result: Any
+    init_debug: dict[str, Any]
+    init_stage_prefix: str
+    if init_method_norm == "tapir":
+        if tapir_cfg is None:
+            tapir_cfg = TapirMatchConfig()
+        _emit_runtime_log(log_fn, "tapir/init start")
+        init_result = estimate_tapir_init_transform(
+            before_rgb=before["rgb"],
+            before_depth_m=before["depth"],
+            before_mask=before["mask"],
+            after_rgb=after["rgb"],
+            after_depth_m=after["depth"],
+            after_mask=after["mask"],
+            intr=before["K"],
+            cfg=tapir_cfg,
+        )
+        debug["tapir_init"] = init_result.debug
+        debug["_tapir_init_raw"] = init_result
+        init_stage_prefix = "tapir"
+        stage_timings["tapir / init"] = time.perf_counter() - t_stage
+        init_debug = init_result.debug or {}
+        tapir_timings = init_debug.get("timings_s") or {}
+        track_e2e_s = float(tapir_timings.get("track", 0.0) or 0.0)
+        track_remote_roundtrip_s = float(tapir_timings.get("track_remote_roundtrip", track_e2e_s) or track_e2e_s)
+        stage_timings["tapir / init no_remote_roundtrip"] = max(
+            0.0,
+            float(stage_timings["tapir / init"]) - track_remote_roundtrip_s,
+        )
+        stage_timings["tapir / remote_roundtrip"] = max(
+            0.0,
+            float(stage_timings["tapir / init"]) - float(stage_timings["tapir / init no_remote_roundtrip"]),
+        )
+        track_no_rpc_io_s = float(tapir_timings.get("track_no_rpc_io", track_e2e_s) or track_e2e_s)
+        stage_timings["tapir / init no_rpc_io"] = max(
+            0.0,
+            float(stage_timings["tapir / init"]) - track_e2e_s + track_no_rpc_io_s,
+        )
+        stage_timings["tapir / rpc_io_overhead"] = max(
+            0.0,
+            float(stage_timings["tapir / init"]) - float(stage_timings["tapir / init no_rpc_io"]),
+        )
+    else:
+        if sam3d_cfg is None:
+            sam3d_cfg = Sam3dMatchConfig()
+        _emit_runtime_log(log_fn, "sam3d/init start")
+        init_result = estimate_sam3d_init_transform(
+            before=before,
+            after=after,
+            cfg=sam3d_cfg,
+            log_fn=log_fn,
+        )
+        sam3d_prior_debug = evaluate_sam3d_prior(
+            before=before,
+            after=after,
+            T_before_cam_to_after_cam=np.asarray(init_result.T_before_cam_to_after_cam, dtype=np.float64).reshape(4, 4),
+            cfg=sam3d_cfg,
+            reg_cfg=cfg,
+            log_fn=log_fn,
+        )
+        init_result.debug.update({
+            key: value for key, value in sam3d_prior_debug.items()
+            if key != "timings_s"
+        })
+        init_result.debug["timings_s"] = {
+            **(init_result.debug.get("timings_s") or {}),
+            **(sam3d_prior_debug.get("timings_s") or {}),
+        }
+        init_result.debug["timings_s"]["total"] = float(time.perf_counter() - t_stage)
+        init_result.debug["latency_ms"] = int(round(float(init_result.debug["timings_s"]["total"]) * 1000.0))
+        before_pick_overlay = (
+            np.asarray(init_result.before_pick_overlay_rgb, dtype=np.uint8)
+            if init_result.before_pick_overlay_rgb is not None
+            else np.zeros((0, 0, 3), dtype=np.uint8)
+        )
+        after_pick_overlay = (
+            np.asarray(init_result.after_pick_overlay_rgb, dtype=np.uint8)
+            if init_result.after_pick_overlay_rgb is not None
+            else np.zeros((0, 0, 3), dtype=np.uint8)
+        )
+        debug["sam3d_init"] = init_result.debug
+        debug["_sam3d_init_raw"] = init_result
+        debug["_before_pick_overlay_rgb"] = before_pick_overlay
+        debug["_after_pick_overlay_rgb"] = after_pick_overlay
+        init_stage_prefix = "sam3d"
+        stage_timings["sam3d / init"] = time.perf_counter() - t_stage
+        init_debug = init_result.debug or {}
+        sam3d_remote_roundtrip_s = float((init_debug.get("timings_s") or {}).get("remote_roundtrip", 0.0) or 0.0)
+        stage_timings["sam3d / init no_remote_roundtrip"] = max(
+            0.0,
+            float(stage_timings["sam3d / init"]) - sam3d_remote_roundtrip_s,
+        )
+        stage_timings["sam3d / remote_roundtrip"] = max(
+            0.0,
+            float(stage_timings["sam3d / init"]) - float(stage_timings["sam3d / init no_remote_roundtrip"]),
+        )
+        stage_timings["sam3d / infer"] = float((init_debug.get("timings_s") or {}).get("infer", 0.0) or 0.0)
+        stage_timings["sam3d / prior_eval"] = float((init_debug.get("timings_s") or {}).get("prior_eval", 0.0) or 0.0)
+        stage_timings["sam3d / completion_registration"] = float(
+            (init_debug.get("timings_s") or {}).get("completion_registration", 0.0) or 0.0
+        )
     _emit_runtime_log(
         log_fn,
-        f"tapir/init done {stage_timings['tapir / init'] * 1000.0:.1f} ms "
-        f"success={tapir_result.success} valid3d={(tapir_result.debug or {}).get('valid_3d_pairs', 0)} "
-        f"inliers={(tapir_result.debug or {}).get('inlier_count', 0)}",
+        f"{init_stage_prefix}/init done {stage_timings[f'{init_stage_prefix} / init'] * 1000.0:.1f} ms "
+        f"success={bool(getattr(init_result, 'success', False))} "
+        f"valid3d={(init_debug or {}).get('valid_3d_pairs', 0)} "
+        f"inliers={(init_debug or {}).get('inlier_count', (init_debug or {}).get('num_inliers', 0))}",
     )
 
     t_reg_prep = time.perf_counter()
-    seed_candidates, seed_debug = _build_seed_candidates(before, after, tapir_result, tapir_result.debug)
+    if init_method_norm == "sam3d":
+        seed_candidates, seed_debug = _build_sam3d_seed_candidates(before, after, init_result, init_debug)
+    else:
+        seed_candidates, seed_debug = _build_seed_candidates(before, after, init_result, init_debug)
     if not seed_candidates:
-        reason = tapir_result.debug.get("reason") or tapir_result.debug.get("error") or "no valid init seed"
-        raise RuntimeError(f"TAPIR init failed: {reason}")
+        reason = init_debug.get("reason") or init_debug.get("error") or "no valid init seed"
+        raise RuntimeError(f"{init_method_norm.upper()} init failed: {reason}")
     debug["candidate_inits"] = [cand.tag for cand in seed_candidates]
     debug["candidate_search_modes"] = [cand.search_mode for cand in seed_candidates]
     debug["seed_policy"] = seed_debug.get("seed_policy")
@@ -1767,13 +1636,7 @@ def run_reestimation(
         },
     }
     seed_policy = str(seed_debug.get("seed_policy") or "")
-    working_target_points = 0
-    if seed_policy == "tapir_prior_direct":
-        working_target_points = 0
-    elif seed_policy == "tapir_prior_compare":
-        working_target_points = 5000
-    elif seed_policy == "fallback_search":
-        working_target_points = 6000
+    working_target_points = _registration_working_target_points(seed_policy)
     if working_target_points > 0:
         registration_before_pcd, working_clouds_debug["reference"] = _cap_registration_working_pcd(
             before_pcd,
@@ -1830,9 +1693,9 @@ def run_reestimation(
         candidate = seed_candidates[index]
         t_candidate = time.perf_counter()
         _emit_runtime_log(log_fn, f"seed[{index}] start tag={candidate.tag}")
-        if str(candidate.search_mode or "") == "tapir_prior_keep":
+        if str(candidate.search_mode or "") in {"tapir_prior_keep", "sam3d_prior_keep"}:
             T_candidate = np.asarray(candidate.T_init, dtype=np.float64).reshape(4, 4)
-            reg_debug = _tapir_prior_keep_debug(candidate)
+            reg_debug = _prior_keep_debug(candidate)
         else:
             T_candidate, reg_debug = coarse_fine_registration(
                 src_pcd=registration_before_pcd,
@@ -1891,7 +1754,7 @@ def run_reestimation(
             f"score={selection_score:.4f} rmse={candidate_info['rmse_m']:.4f} "
             f"proj_iou={candidate_info['projection_iou']:.3f} vis={candidate_info['visibility_score']:.3f}",
         )
-        if str(candidate.tag) == "tapir_prior_keep":
+        if str(candidate.tag) in {"tapir_prior_keep", "sam3d_prior_keep"}:
             prior_result = {
                 "candidate": candidate,
                 "candidate_index": index,
@@ -1922,7 +1785,7 @@ def run_reestimation(
                 "score_key": score_key,
             }
         index += 1
-    if seed_policy == "tapir_prior_compare":
+    if seed_policy in {"tapir_prior_compare", "sam3d_prior_compare"}:
         keep_prior, prior_compare_debug = _prior_compare_keep_decision(best_result, prior_result)
         seed_debug["prior_compare"] = prior_compare_debug
         if keep_prior and prior_result is not None:
@@ -1964,7 +1827,11 @@ def run_reestimation(
         "fitness": float(reg_debug.get("colored_icp_fitness", reg_debug.get("gicp_fitness", 0.0))),
         "rmse_m": float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
         "coarse_score": float(reg_debug.get("coarse_score", -1e9)),
-        "candidate_index": (-2 if best_result["candidate"].tag == "tapir_prior_local_refine" else int(best_result["candidate_index"])),
+        "candidate_index": (
+            -2
+            if best_result["candidate"].tag in {"tapir_prior_local_refine", "sam3d_prior_local_refine"}
+            else int(best_result["candidate_index"])
+        ),
         "candidate_count": int(len(seed_candidates)),
         "rotation_change_deg": _rotation_angle_deg(T_registration[:3, :3]),
         "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
@@ -1989,8 +1856,12 @@ def run_reestimation(
             "chosen_seed_augmented": bool(best_result["candidate"].metadata.get("extra_angle_deg") is not None),
             "chosen_seed_extra_angle_deg": best_result["candidate"].metadata.get("extra_angle_deg"),
             "candidate_ranking_topk": sorted(candidate_ranking, key=lambda item: item["selection_score"])[:5],
-            "tapir_prior": {
-                **(tapir_result.debug or {}),
+            "prior_debug": {
+                **(init_debug or {}),
+                **best_result["selection_meta"],
+            },
+            f"{init_method_norm}_prior": {
+                **(init_debug or {}),
                 **best_result["selection_meta"],
             },
         },
@@ -2035,7 +1906,7 @@ def _parse_replay_dir_name(replay_dir_name: str) -> str:
     return replay_dir_name[:20]
 
 
-def _result_row(pair: dict[str, Any], save_dir: Path | None = None) -> dict[str, Any]:
+def _result_row(pair: dict[str, Any], save_dir: Path | None = None, init_method: str = "tapir") -> dict[str, Any]:
     before_dir = pair.get("before_dir")
     replay_dir = pair.get("replay_dir")
     log_root = pair.get("log_root")
@@ -2049,7 +1920,7 @@ def _result_row(pair: dict[str, Any], save_dir: Path | None = None) -> dict[str,
         "memory_dir": pair.get("memory_dir", ""),
         "before_id": before_dir.name if isinstance(before_dir, Path) else "",
         "replay_id": replay_dir.name if isinstance(replay_dir, Path) else "",
-        "init_method": "tapir",
+        "init_method": str(init_method or "tapir"),
         "save_dir": str(save_dir) if save_dir else "",
     }
 
@@ -2077,7 +1948,10 @@ def _case_output_dirname(pair: dict[str, Any], seen_names: set[str] | None = Non
 
 def _fill_result_row(row: dict[str, Any], result: ReEstimationResult) -> None:
     debug = result.debug or {}
-    tapir = debug.get("tapir_init", {}) or {}
+    init_method = str(debug.get("init_method") or row.get("init_method") or "tapir")
+    init_debug = (
+        debug.get("tapir_init", {}) if init_method == "tapir" else debug.get("sam3d_init", {})
+    ) or {}
     quality = debug.get("quality", {}) or {}
     row.update(
         {
@@ -2086,21 +1960,39 @@ def _fill_result_row(row: dict[str, Any], result: ReEstimationResult) -> None:
             "elapsed_s": result.elapsed_s,
             "best_init": debug.get("best_init", "tapir"),
             "best_score": debug.get("best_score"),
-            "tapir_success": tapir.get("success"),
-            "tapir_backend": tapir.get("backend"),
-            "tapir_remote_host": tapir.get("remote_host"),
-            "tapir_remote_port": tapir.get("remote_port"),
-            "tapir_matches": tapir.get("num_matches"),
-            "tapir_valid3d": tapir.get("num_valid_3d_matches"),
-            "tapir_inliers": tapir.get("num_inliers"),
-            "tapir_inlier_ratio": tapir.get("inlier_ratio"),
-            "tapir_rmse_m": tapir.get("ransac_rmse_m"),
-            "tapir_track_e2e_ms": tapir.get("tapir_latency_ms"),
-            "tapir_track_no_remote_roundtrip_ms": tapir.get("tapir_latency_no_remote_roundtrip_ms"),
-            "tapir_track_no_rpc_io_ms": tapir.get("tapir_latency_no_rpc_io_ms"),
-            "tapir_init_e2e_ms": tapir.get("tapir_init_latency_ms"),
-            "tapir_init_no_remote_roundtrip_ms": tapir.get("tapir_init_latency_no_remote_roundtrip_ms"),
-            "tapir_init_no_rpc_io_ms": tapir.get("tapir_init_latency_no_rpc_io_ms"),
+            "init_method": init_method,
+            "init_success": init_debug.get("success"),
+            "init_backend": init_debug.get("backend"),
+            "init_api_url": init_debug.get("api_url"),
+            "init_matches": init_debug.get("num_matches"),
+            "init_valid3d": init_debug.get("num_valid_3d_matches"),
+            "init_inliers": init_debug.get("num_inliers"),
+            "init_inlier_ratio": init_debug.get("inlier_ratio"),
+            "init_rmse_m": init_debug.get("ransac_rmse_m", init_debug.get("rmse_m")),
+            "init_e2e_ms": init_debug.get("tapir_init_latency_ms", init_debug.get("latency_ms")),
+            "init_no_remote_roundtrip_ms": init_debug.get(
+                "tapir_init_latency_no_remote_roundtrip_ms",
+                init_debug.get("latency_ms"),
+            ),
+            "init_no_rpc_io_ms": init_debug.get(
+                "tapir_init_latency_no_rpc_io_ms",
+                init_debug.get("latency_ms"),
+            ),
+            "tapir_success": init_debug.get("success") if init_method == "tapir" else "",
+            "tapir_backend": init_debug.get("backend") if init_method == "tapir" else "",
+            "tapir_remote_host": init_debug.get("remote_host") if init_method == "tapir" else "",
+            "tapir_remote_port": init_debug.get("remote_port") if init_method == "tapir" else "",
+            "tapir_matches": init_debug.get("num_matches") if init_method == "tapir" else "",
+            "tapir_valid3d": init_debug.get("num_valid_3d_matches") if init_method == "tapir" else "",
+            "tapir_inliers": init_debug.get("num_inliers") if init_method == "tapir" else "",
+            "tapir_inlier_ratio": init_debug.get("inlier_ratio") if init_method == "tapir" else "",
+            "tapir_rmse_m": init_debug.get("ransac_rmse_m") if init_method == "tapir" else "",
+            "tapir_track_e2e_ms": init_debug.get("tapir_latency_ms") if init_method == "tapir" else "",
+            "tapir_track_no_remote_roundtrip_ms": init_debug.get("tapir_latency_no_remote_roundtrip_ms") if init_method == "tapir" else "",
+            "tapir_track_no_rpc_io_ms": init_debug.get("tapir_latency_no_rpc_io_ms") if init_method == "tapir" else "",
+            "tapir_init_e2e_ms": init_debug.get("tapir_init_latency_ms") if init_method == "tapir" else "",
+            "tapir_init_no_remote_roundtrip_ms": init_debug.get("tapir_init_latency_no_remote_roundtrip_ms") if init_method == "tapir" else "",
+            "tapir_init_no_rpc_io_ms": init_debug.get("tapir_init_latency_no_rpc_io_ms") if init_method == "tapir" else "",
             "visibility_score": debug.get("reg_visibility_score"),
             "visible_count": debug.get("reg_visible_count"),
             "depth_ok_ratio": debug.get("reg_depth_ok_ratio"),
@@ -2120,13 +2012,20 @@ def _write_pair_outputs(
     result: ReEstimationResult,
     cfg_used: RegistrationConfig,
 ) -> None:
+    init_method = str((result.debug or {}).get("init_method") or "tapir")
+    init_stage_prefix = "tapir" if init_method == "tapir" else "sam3d"
+    init_debug_payload = dict((result.debug or {}).get(f"{init_method}_init") or {})
     save_dir.mkdir(parents=True, exist_ok=True)
     for stale_name in (
         "error.txt",
         "tapir_error.txt",
+        "sam3d_error.txt",
         "tapir.ply",
         "tapir_overlay.png",
         "tapir_matches_overlay.png",
+        "sam3d_completion.ply",
+        "sam3d_before_pick_overlay.png",
+        "sam3d_after_pick_overlay.png",
         "left_replay_object_overlay.png",
     ):
         stale_path = save_dir / stale_name
@@ -2136,6 +2035,7 @@ def _write_pair_outputs(
         "left_replay_object_overlay_no_trim_tapir_*.png",
         "tapir_correspondence_overlay_*.png",
         "left_replay_object_tapir_prior_overlay_*.png",
+        "left_replay_object_sam3d_prior_overlay*.png",
         "left_replay_triptych_*.png",
     ):
         for stale_path in save_dir.glob(stale_pattern):
@@ -2155,9 +2055,9 @@ def _write_pair_outputs(
     overlay_with_reference = _prepend_reference_panel_rgb(before["rgb"], overlay)
     cv2.imwrite(str(save_dir / "left_replay_overlay.png"), cv2.cvtColor(overlay_with_reference, cv2.COLOR_RGB2BGR))
 
-    tapir_raw = result.debug.get("_tapir_init_raw")
-    if tapir_raw is not None:
-        tapir_match_vis = draw_tapir_matches(before["rgb"], after["rgb"], tapir_raw)
+    init_raw = result.debug.get("_tapir_init_raw") if init_method == "tapir" else result.debug.get("_sam3d_init_raw")
+    if init_method == "tapir" and init_raw is not None:
+        tapir_match_vis = draw_tapir_matches(before["rgb"], after["rgb"], init_raw)
         requested_points = int(((result.debug.get("tapir_init") or {}).get("requested_points")) or 0)
         mode = str(((result.debug.get("tapir_init") or {}).get("sampling_mode")) or "uniform_random")
         if requested_points > 0:
@@ -2165,10 +2065,10 @@ def _write_pair_outputs(
                 str(save_dir / f"tapir_correspondence_overlay_{mode}_{requested_points}.png"),
                 cv2.cvtColor(tapir_match_vis, cv2.COLOR_RGB2BGR),
             )
-        tapir_T = _reconstruct_tapir_transform(tapir_raw)
-        if tapir_T is not None:
+        init_T = _reconstruct_tapir_transform(init_raw)
+        if init_T is not None:
             tapir_aligned = copy_pcd(bp)
-            tapir_aligned.transform(tapir_T)
+            tapir_aligned.transform(init_T)
             tapir_overlay = _draw_registration_overlay(after["rgb"], after["mask"], tapir_aligned, after["K"])
             if requested_points > 0:
                 tapir_overlay_with_reference = _prepend_reference_panel_rgb(before["rgb"], tapir_overlay)
@@ -2176,6 +2076,29 @@ def _write_pair_outputs(
                     str(save_dir / f"left_replay_object_tapir_prior_overlay_{mode}_{requested_points}.png"),
                     cv2.cvtColor(tapir_overlay_with_reference, cv2.COLOR_RGB2BGR),
                 )
+    elif init_method == "sam3d":
+        before_pick_overlay = np.asarray(result.debug.get("_before_pick_overlay_rgb", np.zeros((0, 0, 3), dtype=np.uint8)), dtype=np.uint8)
+        after_pick_overlay = np.asarray(result.debug.get("_after_pick_overlay_rgb", np.zeros((0, 0, 3), dtype=np.uint8)), dtype=np.uint8)
+        if before_pick_overlay.size > 0:
+            cv2.imwrite(
+                str(save_dir / "sam3d_before_pick_overlay.png"),
+                cv2.cvtColor(before_pick_overlay, cv2.COLOR_RGB2BGR),
+            )
+        if after_pick_overlay.size > 0:
+            cv2.imwrite(
+                str(save_dir / "sam3d_after_pick_overlay.png"),
+                cv2.cvtColor(after_pick_overlay, cv2.COLOR_RGB2BGR),
+            )
+        init_T = _reconstruct_tapir_transform(init_raw)
+        if init_T is not None:
+            sam3d_aligned = copy_pcd(bp)
+            sam3d_aligned.transform(init_T)
+            sam3d_overlay = _draw_registration_overlay(after["rgb"], after["mask"], sam3d_aligned, after["K"])
+            sam3d_overlay_with_reference = _prepend_reference_panel_rgb(before["rgb"], sam3d_overlay)
+            cv2.imwrite(
+                str(save_dir / "left_replay_object_sam3d_prior_overlay.png"),
+                cv2.cvtColor(sam3d_overlay_with_reference, cv2.COLOR_RGB2BGR),
+            )
 
     ref_mask = np.asarray(before["mask"]) > 0
     ys, xs = np.nonzero(ref_mask)
@@ -2192,18 +2115,18 @@ def _write_pair_outputs(
     with open(save_dir / "registration.json", "w", encoding="utf-8") as handle:
         json.dump(registration_summary, handle, indent=2, default=str)
 
-    tapir_prior_payload = dict(result.debug.get("tapir_init") or {})
-    tapir_prior_payload["request_id"] = after.get("request", {}).get("request_id") or pair["replay_dir"].name
-    tapir_prior_payload["applied"] = _reconstruct_tapir_transform(tapir_raw) is not None
-    tapir_prior_payload["ransac"] = {
-        "ok": bool(tapir_prior_payload.get("ransac_success", False)),
-        "reason": tapir_prior_payload.get("reason", "ok" if tapir_prior_payload.get("success") else ""),
-        "iters": int(tapir_prior_payload.get("ransac_num_hypotheses", 0) or 0),
+    init_prior_payload = dict(init_debug_payload)
+    init_prior_payload["request_id"] = after.get("request", {}).get("request_id") or pair["replay_dir"].name
+    init_prior_payload["applied"] = _reconstruct_tapir_transform(init_raw) is not None
+    init_prior_payload["ransac"] = {
+        "ok": bool(init_prior_payload.get("ransac_success", False)),
+        "reason": init_prior_payload.get("reason", "ok" if init_prior_payload.get("success") else ""),
+        "iters": int(init_prior_payload.get("ransac_num_hypotheses", 0) or 0),
         "sample_size": 4,
-        "threshold_m": float(tapir_prior_payload.get("ransac_thresh_m", tapir_prior_payload.get("rmse_m", 0.0)) or 0.0),
+        "threshold_m": float(init_prior_payload.get("ransac_thresh_m", init_prior_payload.get("rmse_m", 0.0)) or 0.0),
     }
-    with open(save_dir / "tapir_prior_debug.json", "w", encoding="utf-8") as handle:
-        json.dump(tapir_prior_payload, handle, indent=2, default=str)
+    with open(save_dir / f"{init_method}_prior_debug.json", "w", encoding="utf-8") as handle:
+        json.dump(init_prior_payload, handle, indent=2, default=str)
 
     result_payload = {
         "case": {
@@ -2215,7 +2138,7 @@ def _write_pair_outputs(
         "success": result.success,
         "quality": (result.debug.get("quality") or {}).get("quality", ""),
         "elapsed_s": result.elapsed_s,
-        "init_method": "tapir",
+        "init_method": init_method,
         "T_registration": np.asarray(result.T_registration, dtype=np.float64).tolist(),
         "T_slip": np.asarray(result.T_slip, dtype=np.float64).tolist(),
         "metrics": {
@@ -2230,6 +2153,7 @@ def _write_pair_outputs(
             "depth_ok_ratio": result.debug.get("reg_depth_ok_ratio"),
         },
         "tapir_init": result.debug.get("tapir_init"),
+        "sam3d_init": result.debug.get("sam3d_init"),
         "registration": result.debug.get("registration_summary"),
         "stage_timings_s": result.debug.get("stage_timings_s"),
     }
@@ -2244,22 +2168,25 @@ def _write_pair_outputs(
         "experiment_config": after.get("experiment_config", {}) or {},
         "timings_ms": {
             "total": int(round(float(result.elapsed_s) * 1000.0)),
-            "tapir": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
-            "tapir_no_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
-            "tapir_e2e": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init", 0.0)) * 1000.0))),
-            "tapir_no_rpc_io": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_rpc_io", 0.0)) * 1000.0))),
+            "init": int(round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / init", 0.0)) * 1000.0))),
         },
         "selected_variant": (after.get("selected_replay_pose", {}) or {}).get("variant_name"),
         "overlay_path": str(save_dir / "left_replay_overlay.png"),
         "registration": result.debug.get("registration_summary"),
         "timings_detail_ms": {
             "service": {
-                "tapir_prior": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
-                "tapir_prior_no_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_remote_roundtrip", 0.0)) * 1000.0))),
-                "tapir_prior_e2e": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init", 0.0)) * 1000.0))),
-                "tapir_prior_no_rpc_io": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / init no_rpc_io", 0.0)) * 1000.0))),
-                "tapir_prior_remote_roundtrip": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / remote_roundtrip", 0.0)) * 1000.0))),
-                "tapir_prior_rpc_io_overhead": int(round(float(((result.debug.get("stage_timings_s") or {}).get("tapir / rpc_io_overhead", 0.0)) * 1000.0))),
+                "init_method": init_method,
+                "init": int(round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / init", 0.0)) * 1000.0))),
+                "init_no_remote_roundtrip": int(
+                    round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / init no_remote_roundtrip", 0.0)) * 1000.0))
+                ),
+                "init_remote_roundtrip": int(
+                    round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / remote_roundtrip", 0.0)) * 1000.0))
+                ),
+                "init_infer": int(round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / infer", 0.0)) * 1000.0))),
+                "init_prior_eval": int(round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / prior_eval", 0.0)) * 1000.0))),
+                "init_completion_registration": int(round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / completion_registration", 0.0)) * 1000.0))),
+                f"{init_method}_prior": int(round(float(((result.debug.get("stage_timings_s") or {}).get(f"{init_stage_prefix} / init", 0.0)) * 1000.0))),
                 "registration": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / total", 0.0)) * 1000.0))),
                 "registration_prep": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / prep", 0.0)) * 1000.0))),
                 "registration_refine": int(round(float(((result.debug.get("stage_timings_s") or {}).get("registration / refine", 0.0)) * 1000.0))),
@@ -2316,6 +2243,8 @@ def run_dof_cached_pair(
     memory_dir: str = "",
     voxel_size: float = 0.003,
     tapir_cfg: TapirMatchConfig | None = None,
+    sam3d_cfg: Sam3dMatchConfig | None = None,
+    init_method: str = "tapir",
     log_fn=None,
 ) -> dict[str, Any]:
     if callable(log_fn):
@@ -2332,7 +2261,7 @@ def run_dof_cached_pair(
         "log_root": replay_path.parent.parent,
         "memory_dir": str(memory_dir or ""),
     }
-    row = _result_row(pair, out_path)
+    row = _result_row(pair, out_path, init_method=init_method)
 
     try:
         before = _load_dof_artifact_sample(before_path, is_replay=False)
@@ -2349,8 +2278,10 @@ def run_dof_cached_pair(
             before=before,
             after=after,
             tapir_cfg=tapir_cfg_used,
+            sam3d_cfg=sam3d_cfg,
             cfg=cfg_used,
             log_fn=log,
+            init_method=init_method,
         )
 
         _write_pair_outputs(out_path, pair, before, after, result, cfg_used)
@@ -2359,7 +2290,7 @@ def run_dof_cached_pair(
     except Exception as exc:
         out_path.mkdir(parents=True, exist_ok=True)
         row["error"] = str(exc)
-        with open(out_path / "tapir_error.txt", "w", encoding="utf-8") as handle:
+        with open(out_path / f"{str(init_method or 'tapir')}_error.txt", "w", encoding="utf-8") as handle:
             handle.write(str(exc) + "\n\n" + traceback.format_exc())
         return {"success": False, "row": row, "error": str(exc), "save_dir": str(out_path)}
 
@@ -2375,6 +2306,17 @@ def _save_batch_summary(csv_path: Path, rows: list[dict[str, Any]]) -> None:
         "elapsed_s",
         "best_init",
         "best_score",
+        "init_success",
+        "init_backend",
+        "init_api_url",
+        "init_matches",
+        "init_valid3d",
+        "init_inliers",
+        "init_inlier_ratio",
+        "init_rmse_m",
+        "init_e2e_ms",
+        "init_no_remote_roundtrip_ms",
+        "init_no_rpc_io_ms",
         "tapir_success",
         "tapir_backend",
         "tapir_remote_host",
@@ -2415,6 +2357,8 @@ def run_dof_batch(
     limit: int | None = None,
     voxel_size: float = 0.003,
     tapir_cfg: TapirMatchConfig | None = None,
+    sam3d_cfg: Sam3dMatchConfig | None = None,
+    init_method: str = "tapir",
     log_fn=None,
 ) -> dict[str, Any]:
     if callable(log_fn):
@@ -2439,7 +2383,7 @@ def run_dof_batch(
         replay_dir = pair["replay_dir"]
         pair_save_dir = out_root / _case_output_dirname(pair, used_output_names)
         if before_dir is None:
-            row = _result_row(pair, pair_save_dir)
+            row = _result_row(pair, pair_save_dir, init_method=init_method)
             row["error"] = f"Cannot resolve memory_dir: {pair.get('memory_dir', '')}"
             rows.append(row)
             log(f"[{index}/{len(pairs)}] SKIP {replay_dir.name}: {row['error']}")
@@ -2453,6 +2397,8 @@ def run_dof_batch(
             memory_dir=pair.get("memory_dir", ""),
             voxel_size=voxel_size,
             tapir_cfg=tapir_cfg,
+            sam3d_cfg=sam3d_cfg,
+            init_method=init_method,
             log_fn=log,
         )
         row = ret["row"]
@@ -2463,7 +2409,11 @@ def run_dof_batch(
         if ret.get("success") and ret.get("result") is not None:
             result = ret["result"]
             stage_timings = result.debug.get("stage_timings_s") or {}
-            tapir_timings = ((result.debug.get("tapir_init") or {}).get("timings_s")) or {}
+            init_timings = (
+                (result.debug.get("tapir_init") or {}).get("timings_s")
+                if str(result.debug.get("init_method") or "") == "tapir"
+                else (result.debug.get("sam3d_init") or {}).get("timings_s")
+            ) or {}
             log(
                 "  timings(ms): "
                 + " ".join(
@@ -2471,12 +2421,12 @@ def run_dof_batch(
                     for name, value in stage_timings.items()
                 )
             )
-            if tapir_timings:
+            if init_timings:
                 log(
-                    "  tapir_detail(ms): "
+                    "  init_detail(ms): "
                     + " ".join(
                         f"{name}={float(value) * 1000.0:.1f}"
-                        for name, value in tapir_timings.items()
+                        for name, value in init_timings.items()
                     )
                 )
 
@@ -2505,20 +2455,33 @@ def run_dof_batch(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="TAPIR-only DOF batch pipeline")
+    parser = argparse.ArgumentParser(description="DOF batch pipeline with TAPIR or SAM3D init")
     parser.add_argument("dof_match_dir", nargs="?", default=DEFAULT_DOF_MATCH_DIR, help="dof_match root directory")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="batch output directory")
     parser.add_argument("--start", type=int, default=0, help="start offset for batch cases")
     parser.add_argument("--limit", type=int, default=0, help="maximum number of cases to run; 0 means no limit")
     parser.add_argument("--voxel-size", type=float, default=0.003, help="point cloud voxel size in meters")
+    parser.add_argument("--init-method", choices=("tapir", "sam3d"), default="tapir", help="init method to run")
     parser.add_argument("--tapir-host", default=DEFAULT_TAPIR_HOST, help="remote TAPIR host")
     parser.add_argument("--tapir-port", type=int, default=DEFAULT_TAPIR_PORT, help="remote TAPIR port")
+    parser.add_argument("--sam3d-url", default=DEFAULT_SAM3D_URL, help="SAM3D infer service base URL")
+    parser.add_argument("--sam3d-timeout", type=float, default=60.0, help="SAM3D request timeout in seconds")
+    parser.add_argument("--sam3d-seed", type=int, default=0, help="SAM3D infer seed")
+    parser.add_argument("--sam3d-crop-to-mask", action="store_true", help="crop SAM3D infer inputs to mask bbox")
+    parser.add_argument("--sam3d-no-pointmap", action="store_true", help="disable sending dense pointmap to SAM3D")
     args = parser.parse_args()
 
     tapir_cfg = TapirMatchConfig(
         backend="remote_tapnet",
         remote_host=str(args.tapir_host),
         remote_port=int(args.tapir_port),
+    )
+    sam3d_cfg = Sam3dMatchConfig(
+        api_url=str(args.sam3d_url),
+        timeout_s=float(args.sam3d_timeout),
+        infer_seed=int(args.sam3d_seed),
+        crop_to_mask=bool(args.sam3d_crop_to_mask),
+        use_pointmap=bool(not args.sam3d_no_pointmap),
     )
     summary = run_dof_batch(
         dof_match_dir=args.dof_match_dir,
@@ -2527,9 +2490,11 @@ def main() -> None:
         limit=(int(args.limit) if int(args.limit) > 0 else None),
         voxel_size=float(args.voxel_size),
         tapir_cfg=tapir_cfg,
+        sam3d_cfg=sam3d_cfg,
+        init_method=str(args.init_method),
     )
     print(
-        f"TAPIR batch done: ok={summary['ok']} failed={summary['failed']} "
+        f"{str(args.init_method).upper()} batch done: ok={summary['ok']} failed={summary['failed']} "
         f"total={summary['total']} output={summary['output_dir']}"
     )
 
