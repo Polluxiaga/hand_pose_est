@@ -814,6 +814,72 @@ def _selection_score(reg_debug: dict[str, Any], proj_metrics: dict[str, Any]) ->
     }
 
 
+def _final_eval_from_reg_debug(reg_debug: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    visibility_score = reg_debug.get("final_visibility_score")
+    visible_count = reg_debug.get("final_visible_count")
+    depth_ok_ratio = reg_debug.get("final_depth_ok_ratio")
+    projection_iou = reg_debug.get("final_projection_iou")
+    projection_precision = reg_debug.get("final_projection_precision")
+    projection_recall = reg_debug.get("final_projection_recall")
+    required_values = (
+        visibility_score,
+        visible_count,
+        depth_ok_ratio,
+        projection_iou,
+        projection_precision,
+        projection_recall,
+    )
+    if any(value is None for value in required_values):
+        return None
+    return (
+        {
+            "score": float(visibility_score),
+            "visible_count": float(visible_count),
+            "depth_ok_ratio": float(depth_ok_ratio),
+        },
+        {
+            "projection_iou": float(projection_iou),
+            "projection_precision": float(projection_precision),
+            "projection_recall": float(projection_recall),
+        },
+    )
+
+
+def _should_early_stop_fallback_candidate(
+    candidate: SeedCandidate,
+    selection_score: float,
+    reg_debug: dict[str, Any],
+    visibility: dict[str, Any],
+    proj_metrics: dict[str, Any],
+) -> tuple[bool, str]:
+    if str(candidate.search_mode or "") not in {"fallback_light", "fallback_heavy"}:
+        return False, ""
+    reg_fitness = float(reg_debug.get("colored_icp_fitness", reg_debug.get("gicp_fitness", 0.0)))
+    reg_rmse = float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf)))
+    projection_iou = float(proj_metrics.get("projection_iou", 0.0))
+    projection_precision = float(proj_metrics.get("projection_precision", 0.0))
+    projection_recall = float(proj_metrics.get("projection_recall", 0.0))
+    visibility_score = float(visibility.get("score", 0.0))
+    strong_candidate = bool(
+        np.isfinite(reg_rmse)
+        and float(selection_score) <= 0.26
+        and reg_fitness >= 0.99
+        and reg_rmse <= 0.008
+        and projection_iou >= 0.60
+        and projection_precision >= 0.88
+        and projection_recall >= 0.65
+        and visibility_score >= 0.55
+    )
+    if not strong_candidate:
+        return False, ""
+    return True, (
+        "strong_fallback_candidate"
+        f"(score={selection_score:.3f},fit={reg_fitness:.3f},rmse={reg_rmse:.4f},"
+        f"iou={projection_iou:.3f},precision={projection_precision:.3f},"
+        f"recall={projection_recall:.3f},vis={visibility_score:.3f})"
+    )
+
+
 def _prior_compare_keep_decision(
     best_result: dict[str, Any] | None,
     prior_result: dict[str, Any] | None,
@@ -1297,20 +1363,10 @@ def coarse_fine_registration(
     debug["gicp_fitness"] = float(gicp_res.fitness)
     debug["gicp_inlier_rmse"] = float(gicp_res.inlier_rmse)
     debug["gicp_ms"] = int(round((time.perf_counter() - t_gicp) * 1000.0))
-    gicp_eval = _evaluate_registration_transform(
-        src_pcd=src_pcd,
-        tgt_pcd=tgt_pcd,
-        T_candidate=T_gicp,
-        after_depth_m=after_depth_m,
-        after_rgb=after_rgb,
-        after_mask=after_mask,
-        after_intr=after_intr,
-        cfg=cfg,
-    )
-    debug["gicp_visibility_score"] = float(gicp_eval["visibility_score"])
-    debug["gicp_projection_iou"] = float(gicp_eval["projection_iou"])
+    gicp_eval: dict[str, float] | None = None
 
     T_final = T_gicp
+    colored_eval: dict[str, float] | None = None
     t_colored = time.perf_counter()
     if not bool(getattr(refine_cfg, "use_colored_icp", False)):
         debug["colored_icp_disabled"] = True
@@ -1320,6 +1376,18 @@ def coarse_fine_registration(
         debug["colored_icp_fitness"] = debug["gicp_fitness"]
         debug["colored_icp_inlier_rmse"] = debug["gicp_inlier_rmse"]
     else:
+        gicp_eval = _evaluate_registration_transform(
+            src_pcd=src_pcd,
+            tgt_pcd=tgt_pcd,
+            T_candidate=T_gicp,
+            after_depth_m=after_depth_m,
+            after_rgb=after_rgb,
+            after_mask=after_mask,
+            after_intr=after_intr,
+            cfg=cfg,
+        )
+        debug["gicp_visibility_score"] = float(gicp_eval["visibility_score"])
+        debug["gicp_projection_iou"] = float(gicp_eval["projection_iou"])
         try:
             T_colored, colored_res = refine_with_colored_icp(src_pcd, tgt_pcd, T_gicp, refine_cfg)
             colored_fitness = float(colored_res.fitness)
@@ -1370,6 +1438,28 @@ def coarse_fine_registration(
             debug["colored_icp_fitness"] = debug["gicp_fitness"]
             debug["colored_icp_inlier_rmse"] = debug["gicp_inlier_rmse"]
     debug["colored_icp_ms"] = int(round((time.perf_counter() - t_colored) * 1000.0))
+    if gicp_eval is None:
+        gicp_eval = _evaluate_registration_transform(
+            src_pcd=src_pcd,
+            tgt_pcd=tgt_pcd,
+            T_candidate=T_gicp,
+            after_depth_m=after_depth_m,
+            after_rgb=after_rgb,
+            after_mask=after_mask,
+            after_intr=after_intr,
+            cfg=cfg,
+        )
+        debug["gicp_visibility_score"] = float(gicp_eval["visibility_score"])
+        debug["gicp_projection_iou"] = float(gicp_eval["projection_iou"])
+    final_eval = gicp_eval
+    if debug.get("colored_icp_effective_source") == "colored_icp" and colored_eval is not None:
+        final_eval = colored_eval
+    debug["final_visibility_score"] = float(final_eval.get("visibility_score", 0.0))
+    debug["final_visible_count"] = float(final_eval.get("visible_count", 0.0))
+    debug["final_depth_ok_ratio"] = float(final_eval.get("depth_ok_ratio", 0.0))
+    debug["final_projection_iou"] = float(final_eval.get("projection_iou", 0.0))
+    debug["final_projection_precision"] = float(final_eval.get("projection_precision", 0.0))
+    debug["final_projection_recall"] = float(final_eval.get("projection_recall", 0.0))
     debug["total_reg_ms"] = int(round((time.perf_counter() - t0) * 1000.0))
     return T_final, debug
 
@@ -1462,6 +1552,12 @@ def _maybe_override_fallback_light_result(
     updated_debug["colored_icp_inlier_rmse"] = float(raw_eval["rmse_m"])
     updated_debug["gicp_visibility_score"] = float(raw_visibility.get("score", 0.0))
     updated_debug["gicp_projection_iou"] = float(raw_proj_metrics.get("projection_iou", 0.0))
+    updated_debug["final_visibility_score"] = float(raw_visibility.get("score", 0.0))
+    updated_debug["final_visible_count"] = float(raw_visibility.get("visible_count", 0.0))
+    updated_debug["final_depth_ok_ratio"] = float(raw_visibility.get("depth_ok_ratio", 0.0))
+    updated_debug["final_projection_iou"] = float(raw_proj_metrics.get("projection_iou", 0.0))
+    updated_debug["final_projection_precision"] = float(raw_proj_metrics.get("projection_precision", 0.0))
+    updated_debug["final_projection_recall"] = float(raw_proj_metrics.get("projection_recall", 0.0))
     updated_debug["colored_icp_rejected"] = True
     updated_debug["colored_icp_reject_reasons"] = ["fallback_prefilter_keep"]
     return raw_T, updated_debug, raw_visibility, raw_proj_metrics
@@ -1762,6 +1858,8 @@ def run_reestimation(
     t_stage = time.perf_counter()
     ref_proj_points = np.asarray(before_pcd.points, dtype=np.float64)
     prior_result: dict[str, Any] | None = None
+    early_stop_used = False
+    early_stop_reason = ""
     index = 0
     while index < len(seed_candidates):
         candidate = seed_candidates[index]
@@ -1781,18 +1879,22 @@ def run_reestimation(
                 after_intr=before["K"],
                 cfg=cfg,
                 search_mode=str(candidate.search_mode or "full"),
-        )
-        visibility = visibility_aware_score(
-            src_pcd_base=registration_before_pcd,
-            tgt_pcd_base=registration_after_pcd,
-            T_srcbase_to_tgtbase=T_candidate,
-            wrist_depth=after["depth"],
-            wrist_rgb=after["rgb"],
-            wrist_intr=before["K"],
-            T_wrist_to_base=np.eye(4, dtype=np.float64),
-            cfg=cfg,
-        )
-        proj_metrics = _projection_metrics(ref_proj_points, T_candidate, after["mask"], before["K"])
+            )
+        final_eval = _final_eval_from_reg_debug(reg_debug)
+        if final_eval is None:
+            visibility = visibility_aware_score(
+                src_pcd_base=registration_before_pcd,
+                tgt_pcd_base=registration_after_pcd,
+                T_srcbase_to_tgtbase=T_candidate,
+                wrist_depth=after["depth"],
+                wrist_rgb=after["rgb"],
+                wrist_intr=before["K"],
+                T_wrist_to_base=np.eye(4, dtype=np.float64),
+                cfg=cfg,
+            )
+            proj_metrics = _projection_metrics(ref_proj_points, T_candidate, after["mask"], before["K"])
+        else:
+            visibility, proj_metrics = final_eval
         T_candidate, reg_debug, visibility, proj_metrics = _maybe_override_fallback_light_result(
             candidate=candidate,
             T_candidate=T_candidate,
@@ -1862,6 +1964,23 @@ def run_reestimation(
                 "selection_meta": selection_meta,
                 "score_key": score_key,
             }
+        if index + 1 < len(seed_candidates):
+            should_stop, stop_reason = _should_early_stop_fallback_candidate(
+                candidate=candidate,
+                selection_score=selection_score,
+                reg_debug=reg_debug,
+                visibility=visibility,
+                proj_metrics=proj_metrics,
+            )
+            if should_stop:
+                early_stop_used = True
+                early_stop_reason = stop_reason
+                _emit_runtime_log(
+                    log_fn,
+                    f"fallback early-stop at seed[{index}] reason={stop_reason} "
+                    f"skip={len(seed_candidates) - index - 1}",
+                )
+                break
         index += 1
     if seed_policy in {"tapir_prior_compare", "sam3d_prior_compare"}:
         keep_prior, prior_compare_debug = _prior_compare_keep_decision(best_result, prior_result)
@@ -1900,6 +2019,11 @@ def run_reestimation(
     debug["candidate_ranking"] = sorted(candidate_ranking, key=lambda item: item["selection_score"])[:5]
     debug["selection_score"] = float(best_result["selection_score"])
     debug["selection_meta"] = dict(best_result["selection_meta"])
+    evaluated_candidate_count = int(len(candidate_ranking))
+    debug["registration_candidate_count"] = int(len(seed_candidates))
+    debug["registration_evaluated_candidate_count"] = evaluated_candidate_count
+    debug["registration_early_stop_used"] = bool(early_stop_used)
+    debug["registration_early_stop_reason"] = str(early_stop_reason)
     debug["registration_summary"] = {
         "transform_ref_to_cur": T_registration.tolist(),
         "transform_cur_to_ref": _rigid_inverse(T_registration).tolist(),
@@ -1922,6 +2046,12 @@ def run_reestimation(
         "gicp_ms": int(reg_debug.get("gicp_ms", 0) or 0),
         "colored_icp_ms": int(reg_debug.get("colored_icp_ms", 0) or 0),
         "total_reg_ms": int(reg_debug.get("total_reg_ms", 0) or 0),
+        "pipeline_registration_prep_ms": int(round(float(stage_timings.get("registration / prep", 0.0)) * 1000.0)),
+        "pipeline_registration_refine_ms": int(round(float(stage_timings.get("registration / refine", 0.0)) * 1000.0)),
+        "pipeline_registration_total_ms": int(round(float(stage_timings.get("registration / total", 0.0)) * 1000.0)),
+        "evaluated_candidate_count": evaluated_candidate_count,
+        "early_stop_used": bool(early_stop_used),
+        "early_stop_reason": str(early_stop_reason),
         "colored_icp_effective_source": str(reg_debug.get("colored_icp_effective_source", "")),
         "selection_score": float(best_result["selection_score"]),
         "surface_reference_points": int(len(registration_before_pcd.points)),
@@ -2033,6 +2163,8 @@ def _fill_result_row(row: dict[str, Any], result: ReEstimationResult) -> None:
     init_debug = (
         debug.get("tapir_init", {}) if init_method == "tapir" else debug.get("sam3d_init", {})
     ) or {}
+    registration_summary = dict(debug.get("registration_summary") or {})
+    stage_timings = dict(debug.get("stage_timings_s") or {})
     quality = debug.get("quality", {}) or {}
     row.update(
         {
@@ -2074,6 +2206,15 @@ def _fill_result_row(row: dict[str, Any], result: ReEstimationResult) -> None:
             "tapir_init_e2e_ms": init_debug.get("tapir_init_latency_ms") if init_method == "tapir" else "",
             "tapir_init_no_remote_roundtrip_ms": init_debug.get("tapir_init_latency_no_remote_roundtrip_ms") if init_method == "tapir" else "",
             "tapir_init_no_rpc_io_ms": init_debug.get("tapir_init_latency_no_rpc_io_ms") if init_method == "tapir" else "",
+            "registration_search_mode": registration_summary.get("search_mode"),
+            "registration_seed_policy": ((registration_summary.get("seed_debug") or {}).get("seed_policy")),
+            "registration_total_ms": int(round(float(stage_timings.get("registration / total", 0.0)) * 1000.0)),
+            "registration_prep_ms": int(round(float(stage_timings.get("registration / prep", 0.0)) * 1000.0)),
+            "registration_refine_ms": int(round(float(stage_timings.get("registration / refine", 0.0)) * 1000.0)),
+            "registration_best_candidate_ms": registration_summary.get("total_reg_ms"),
+            "registration_candidate_count": registration_summary.get("candidate_count"),
+            "registration_evaluated_candidate_count": registration_summary.get("evaluated_candidate_count"),
+            "registration_early_stop_used": registration_summary.get("early_stop_used"),
             "visibility_score": debug.get("reg_visibility_score"),
             "visible_count": debug.get("reg_visible_count"),
             "depth_ok_ratio": debug.get("reg_depth_ok_ratio"),
@@ -2416,6 +2557,15 @@ def _save_batch_summary(csv_path: Path, rows: list[dict[str, Any]]) -> None:
         "tapir_init_e2e_ms",
         "tapir_init_no_remote_roundtrip_ms",
         "tapir_init_no_rpc_io_ms",
+        "registration_search_mode",
+        "registration_seed_policy",
+        "registration_total_ms",
+        "registration_prep_ms",
+        "registration_refine_ms",
+        "registration_best_candidate_ms",
+        "registration_candidate_count",
+        "registration_evaluated_candidate_count",
+        "registration_early_stop_used",
         "visibility_score",
         "visible_count",
         "depth_ok_ratio",
