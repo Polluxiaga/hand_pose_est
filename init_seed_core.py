@@ -40,7 +40,7 @@ def registration_working_target_points(seed_policy: str) -> int:
     if policy in {"tapir_prior_compare", "sam3d_prior_compare", "sam3d_single_seed"}:
         return 5000
     if policy == "fallback_search":
-        return 6000
+        return 9000
     return 0
 
 
@@ -49,6 +49,7 @@ def prior_keep_debug(candidate: SeedCandidate) -> dict[str, Any]:
     prior_rmse = float(metadata.get("prior_dense_rmse_eval", math.inf))
     prior_fitness = float(metadata.get("prior_dense_fitness_eval", 0.0))
     prior_proj_iou = float(metadata.get("prior_proj_iou", 0.0))
+    prior_proj_recall = float(metadata.get("prior_proj_recall", 0.0))
     keep_tag = str(candidate.tag or "")
     return {
         "search_mode": str(candidate.search_mode or keep_tag),
@@ -61,6 +62,7 @@ def prior_keep_debug(candidate: SeedCandidate) -> dict[str, Any]:
         "gicp_inlier_rmse": prior_rmse,
         "gicp_visibility_score": 0.0,
         "gicp_projection_iou": prior_proj_iou,
+        "gicp_projection_recall": prior_proj_recall,
         "gicp_ms": 0,
         "colored_icp_disabled": True,
         "colored_icp_rejected": True,
@@ -138,7 +140,7 @@ def _build_axis_permutation_candidates(ref_obb: dict[str, Any], cur_obb: dict[st
                         tag="pca_perm",
                         T_init=T,
                         score_hint=0.02,
-                        search_mode="fallback_light",
+                        search_mode="fallback_heavy",
                         metadata={
                             "perm": list(perm),
                             "sign_x": sx,
@@ -218,6 +220,7 @@ def _build_tapir_prior_keep_candidate(tapir_T: np.ndarray, tapir_debug: dict[str
             "prior_dense_fitness_eval": float((tapir_debug or {}).get("prior_dense_fitness_eval", 0.0)),
             "prior_proj_iou": float((tapir_debug or {}).get("prior_proj_iou", 0.0)),
             "prior_proj_precision": float((tapir_debug or {}).get("prior_proj_precision", 0.0)),
+            "prior_proj_recall": float((tapir_debug or {}).get("prior_proj_recall", 0.0)),
         },
     )
 
@@ -233,18 +236,22 @@ def _build_sam3d_prior_keep_candidate(sam3d_T: np.ndarray, sam3d_debug: dict[str
             "prior_dense_fitness_eval": float((sam3d_debug or {}).get("prior_dense_fitness_eval", 0.0)),
             "prior_proj_iou": float((sam3d_debug or {}).get("prior_proj_iou", 0.0)),
             "prior_proj_precision": float((sam3d_debug or {}).get("prior_proj_precision", 0.0)),
+            "prior_proj_recall": float((sam3d_debug or {}).get("prior_proj_recall", 0.0)),
         },
     )
 
 
 def _tapir_compare_refine_search_mode(tapir_debug: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
+    compare_verify_confidence_thresh = float(
+        (tapir_debug or {}).get("prior_confidence_accept_thresh", 0.60) or 0.60
+    )
     proj_iou = float((tapir_debug or {}).get("prior_proj_iou", 0.0) or 0.0)
     proj_precision = float((tapir_debug or {}).get("prior_proj_precision", 0.0) or 0.0)
     rel_dense_rmse = float((tapir_debug or {}).get("prior_dense_relative_rmse_eval", math.inf) or math.inf)
 
     verify_ready = bool(
-        prior_confidence >= 0.56
+        prior_confidence >= compare_verify_confidence_thresh
         and proj_iou >= 0.45
         and proj_precision >= 0.60
         and np.isfinite(rel_dense_rmse)
@@ -292,28 +299,36 @@ def _tapir_compare_entry_decision(tapir_debug: dict[str, Any]) -> tuple[bool, di
     rel_dense_rmse = float((tapir_debug or {}).get("prior_dense_relative_rmse_eval", math.inf) or math.inf)
     inliers = int((tapir_debug or {}).get("num_inliers", (tapir_debug or {}).get("inlier_count", 0)) or 0)
 
-    compare_verify_confidence_thresh = 0.56
+    compare_verify_confidence_thresh = float(
+        (tapir_debug or {}).get("prior_confidence_accept_thresh", 0.60) or 0.60
+    )
     low_inlier_thresh = 4
     low_proj_iou_thresh = 0.36
     low_proj_precision_thresh = 0.52
+    below_compare_confidence = bool(prior_confidence < compare_verify_confidence_thresh)
     weak_projection_support = bool(
         proj_iou < low_proj_iou_thresh
         and proj_precision < low_proj_precision_thresh
     )
     weak_medium_prior = bool(
-        prior_confidence < compare_verify_confidence_thresh
-        and inliers <= low_inlier_thresh
-        and weak_projection_support
+        below_compare_confidence
+        or (inliers <= low_inlier_thresh and weak_projection_support)
     )
+    reason = "tapir_compare_allowed"
+    if weak_medium_prior:
+        reason = (
+            "prior_confidence_below_compare_threshold"
+            if below_compare_confidence
+            else "weak_medium_prior_low_projection_support"
+        )
     return (not weak_medium_prior), {
         "compare_entry_gate_ok": bool(not weak_medium_prior),
-        "compare_entry_reason": (
-            "weak_medium_prior_low_projection_support" if weak_medium_prior else "tapir_compare_allowed"
-        ),
+        "compare_entry_reason": reason,
         "compare_entry_verify_confidence_thresh": float(compare_verify_confidence_thresh),
         "compare_entry_low_inlier_thresh": int(low_inlier_thresh),
         "compare_entry_low_proj_iou_thresh": float(low_proj_iou_thresh),
         "compare_entry_low_proj_precision_thresh": float(low_proj_precision_thresh),
+        "compare_entry_prior_confidence_below_thresh": bool(below_compare_confidence),
         "compare_entry_prior_confidence": float(prior_confidence),
         "compare_entry_proj_iou": float(proj_iou),
         "compare_entry_proj_precision": float(proj_precision),
@@ -387,27 +402,38 @@ def build_tapir_seed_candidates(
     prior_confidence = float((tapir_debug or {}).get("prior_confidence", 0.0) or 0.0)
     prior_confidence_accept = float((tapir_debug or {}).get("prior_confidence_accept_thresh", 0.0) or 0.0)
     prior_confidence_strong = float((tapir_debug or {}).get("prior_confidence_strong_thresh", 1.0) or 1.0)
+    compare_confidence_thresh = float(
+        (tapir_compare_entry_debug or {}).get("compare_entry_verify_confidence_thresh", 0.60) or 0.60
+    )
+    hard_confidence_fallback = bool(prior_confidence < compare_confidence_thresh)
     confidence_tier = "fallback"
     compare_entry_routed_to_fallback = bool(
         tapir_T is not None
         and tapir_gate_ok
         and tapir_seed is not None
-        and not tapir_strong_ok
-        and not tapir_compare_entry_ok
+        and (hard_confidence_fallback or (not tapir_strong_ok and not tapir_compare_entry_ok))
     )
 
     seed_policy = "fallback_search"
-    if tapir_T is not None and tapir_strong_ok:
+    if tapir_T is not None and tapir_strong_ok and not hard_confidence_fallback:
         seed_policy = "tapir_prior_direct"
         confidence_tier = "strong"
         _append_unique_seed(candidates, _build_tapir_prior_keep_candidate(tapir_T, tapir_debug), seen)
-    elif tapir_T is not None and tapir_gate_ok and tapir_seed is not None and tapir_compare_entry_ok:
+    elif (
+        tapir_T is not None
+        and tapir_gate_ok
+        and tapir_seed is not None
+        and tapir_compare_entry_ok
+        and not hard_confidence_fallback
+    ):
         seed_policy = "tapir_prior_compare"
         confidence_tier = "borderline" if tapir_borderline_ok and prior_confidence < prior_confidence_accept else "medium"
         _append_unique_seed(candidates, _build_tapir_prior_keep_candidate(tapir_T, tapir_debug), seen)
         _append_unique_seed(candidates, tapir_seed, seen)
     else:
-        if compare_entry_routed_to_fallback:
+        if hard_confidence_fallback:
+            confidence_tier = "hard_confidence_fallback"
+        elif compare_entry_routed_to_fallback:
             confidence_tier = "medium_routed_fallback"
         for candidate in fallback_candidates:
             _append_unique_seed(candidates, candidate, seen)
@@ -423,6 +449,8 @@ def build_tapir_seed_candidates(
             "tapir_inliers": tapir_inliers,
             **tapir_compare_mode_debug,
             **tapir_compare_entry_debug,
+            "hard_confidence_fallback": bool(hard_confidence_fallback),
+            "hard_confidence_fallback_thresh": float(compare_confidence_thresh),
             "compare_entry_routed_to_fallback": bool(compare_entry_routed_to_fallback),
             "tapir_prior_confidence": float(prior_confidence),
             "tapir_prior_confidence_accept_thresh": float(prior_confidence_accept),

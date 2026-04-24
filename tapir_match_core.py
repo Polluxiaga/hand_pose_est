@@ -76,7 +76,7 @@ class TapirMatchConfig:
     sampling_retry_failed_min_proj_iou: float = 0.32
     sampling_retry_failed_max_rel_dense_rmse: float = 0.065
     requested_points: int = 100
-    prior_confidence_accept_thresh: float = 0.45
+    prior_confidence_accept_thresh: float = 0.60
     prior_confidence_strong_thresh: float = 0.72
     dense_eval_max_points: int = 2048
     projection_eval_downsample: int = 4
@@ -798,19 +798,19 @@ def _projected_surface_metrics(
     downsample: int,
 ) -> dict[str, Any]:
     if len(src_points) == 0:
-        return {"prior_proj_precision": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
+        return {"prior_proj_precision": 0.0, "prior_proj_recall": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
     pts_t = (np.asarray(src_points, dtype=np.float64) @ T_src_to_tgt[:3, :3].T) + T_src_to_tgt[:3, 3]
     z = pts_t[:, 2]
     h, w = target_mask.shape[:2]
     front = np.isfinite(pts_t).all(axis=1) & (z > 1e-5) & (z < float(max_depth_m))
     if not np.any(front):
-        return {"prior_proj_precision": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
+        return {"prior_proj_precision": 0.0, "prior_proj_recall": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
     pts_f = pts_t[front]
     u = np.round((pts_f[:, 0] * float(intr.fx) / pts_f[:, 2]) + float(intr.cx)).astype(np.int32)
     v = np.round((pts_f[:, 1] * float(intr.fy) / pts_f[:, 2]) + float(intr.cy)).astype(np.int32)
     inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
     if not np.any(inside):
-        return {"prior_proj_precision": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
+        return {"prior_proj_precision": 0.0, "prior_proj_recall": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
     ds = max(1, int(downsample))
     hs = max(1, (h + ds - 1) // ds)
     ws = max(1, (w + ds - 1) // ds)
@@ -819,17 +819,20 @@ def _projected_surface_metrics(
     uv[:, 1] = np.clip(uv[:, 1], 0, hs - 1)
     proj_mask, uv_filtered = _projected_uv_to_mask(uv, (hs, ws), point_radius_px=1, connect_radius_px=2)
     if len(uv_filtered) == 0:
-        return {"prior_proj_precision": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
+        return {"prior_proj_precision": 0.0, "prior_proj_recall": 0.0, "prior_proj_iou": 0.0, "prior_proj_pixels": 0}
     target_small = cv2.resize(((np.asarray(target_mask) > 0).astype(np.uint8) * 255), (ws, hs), interpolation=cv2.INTER_NEAREST)
     pred = proj_mask > 0
     gt = target_small > 0
     inter = int(np.logical_and(pred, gt).sum())
     pred_area = int(pred.sum())
+    gt_area = int(gt.sum())
     union = int(np.logical_or(pred, gt).sum())
     precision = float(inter / max(pred_area, 1))
+    recall = float(inter / max(gt_area, 1))
     iou = float(inter / max(union, 1))
     return {
         "prior_proj_precision": precision,
+        "prior_proj_recall": recall,
         "prior_proj_iou": iou,
         "prior_proj_pixels": pred_area,
     }

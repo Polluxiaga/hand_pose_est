@@ -662,15 +662,17 @@ def _rotation_angle_deg(R: np.ndarray) -> float:
 def _projection_metrics(points_ref: np.ndarray, T_ref_to_cur: np.ndarray, cur_mask: np.ndarray, intr: CameraIntrinsics) -> dict[str, Any]:
     uv = _project_points_to_image(_transform_points(points_ref, T_ref_to_cur), intr, cur_mask.shape[:2])
     if len(uv) == 0:
-        return {"projection_precision": 0.0, "projection_iou": 0.0, "projection_pixels": 0}
+        return {"projection_precision": 0.0, "projection_recall": 0.0, "projection_iou": 0.0, "projection_pixels": 0}
     pred_mask, _ = projected_uv_to_mask(uv, cur_mask.shape[:2], point_radius_px=1, connect_radius_px=3)
     pred = pred_mask > 0
     gt = np.asarray(cur_mask) > 0
     inter = int(np.logical_and(pred, gt).sum())
     pred_area = int(pred.sum())
+    gt_area = int(gt.sum())
     union = int(np.logical_or(pred, gt).sum())
     return {
         "projection_precision": float(inter / max(pred_area, 1)),
+        "projection_recall": float(inter / max(gt_area, 1)),
         "projection_iou": float(inter / max(union, 1)),
         "projection_pixels": int(pred_area),
     }
@@ -703,6 +705,7 @@ def _evaluate_registration_transform(
         "depth_ok_ratio": float(visibility.get("depth_ok_ratio", 0.0)),
         "projection_iou": float(proj_metrics.get("projection_iou", 0.0)),
         "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
+        "projection_recall": float(proj_metrics.get("projection_recall", 0.0)),
     }
 
 
@@ -765,26 +768,32 @@ def _colored_icp_guard_decision(
 
 
 def _selection_score(reg_debug: dict[str, Any], proj_metrics: dict[str, Any]) -> tuple[float, dict[str, Any]]:
-    weight = 0.38
+    weight = 0.30
     target_rmse = 0.009
     target_projection_iou = 0.46
     target_projection_precision = 0.90
+    target_projection_recall = 0.60
     target_reg_fitness = 0.955
     rmse = float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf)))
     reg_fitness = float(reg_debug.get("colored_icp_fitness", reg_debug.get("gicp_fitness", 0.0)))
     projection_iou = float(proj_metrics.get("projection_iou", 0.0))
     projection_precision = float(proj_metrics.get("projection_precision", 0.0))
+    projection_recall = float(proj_metrics.get("projection_recall", 0.0))
     rmse_term = min(1.5, rmse / max(target_rmse, 1e-6)) if np.isfinite(rmse) else 1.5
-    iou_penalty = 0.08 * max(0.0, target_projection_iou - projection_iou)
-    precision_penalty = 0.18 * max(0.0, target_projection_precision - projection_precision)
-    fitness_penalty = 0.44 * max(0.0, target_reg_fitness - reg_fitness)
-    final_penalty = iou_penalty + precision_penalty + fitness_penalty
+    # Precision alone can prefer a narrow but "clean" silhouette; recall keeps full-part coverage in the score.
+    iou_penalty = 0.10 * max(0.0, target_projection_iou - projection_iou)
+    precision_penalty = 0.14 * max(0.0, target_projection_precision - projection_precision)
+    recall_penalty = 0.42 * max(0.0, target_projection_recall - projection_recall)
+    fitness_penalty = 0.40 * max(0.0, target_reg_fitness - reg_fitness)
+    final_penalty = iou_penalty + precision_penalty + recall_penalty + fitness_penalty
     invalid_penalty = 0.0
     if reg_fitness <= 1e-6:
         invalid_penalty += 0.8
     if projection_iou <= 1e-6:
         invalid_penalty += 0.8
     if projection_precision <= 1e-6:
+        invalid_penalty += 0.4
+    if projection_recall <= 1e-6:
         invalid_penalty += 0.4
     final_penalty += invalid_penalty
     score = (weight * rmse_term) + final_penalty
@@ -793,10 +802,12 @@ def _selection_score(reg_debug: dict[str, Any], proj_metrics: dict[str, Any]) ->
         "selection_target_rmse_m": target_rmse,
         "selection_target_projection_iou": target_projection_iou,
         "selection_target_projection_precision": target_projection_precision,
+        "selection_target_projection_recall": target_projection_recall,
         "selection_target_reg_fitness": target_reg_fitness,
         "selection_reg_fitness": float(reg_fitness),
         "selection_iou_penalty": float(iou_penalty),
         "selection_precision_penalty": float(precision_penalty),
+        "selection_recall_penalty": float(recall_penalty),
         "selection_fitness_penalty": float(fitness_penalty),
         "selection_invalid_penalty": float(invalid_penalty),
         "final_selection_penalty": float(final_penalty),
@@ -813,14 +824,17 @@ def _prior_compare_keep_decision(
         "prior_tag": str(((prior_result or {}).get("candidate") or SeedCandidate(tag="", T_init=np.eye(4))).tag),
         "best_projection_iou": 0.0,
         "best_projection_precision": 0.0,
+        "best_projection_recall": 0.0,
         "best_rmse_m": math.inf,
         "best_fitness": 0.0,
         "prior_projection_iou": 0.0,
         "prior_projection_precision": 0.0,
+        "prior_projection_recall": 0.0,
         "prior_rmse_m": math.inf,
         "prior_fitness": 0.0,
         "iou_gain": 0.0,
         "precision_gain": 0.0,
+        "recall_gain": 0.0,
         "rmse_drop_m": 0.0,
         "fitness_gain": 0.0,
         "soft_tradeoff_accept": False,
@@ -843,22 +857,27 @@ def _prior_compare_keep_decision(
     prior_iou = float(prior_proj.get("projection_iou", 0.0))
     best_precision = float(best_proj.get("projection_precision", 0.0))
     prior_precision = float(prior_proj.get("projection_precision", 0.0))
+    best_recall = float(best_proj.get("projection_recall", 0.0))
+    prior_recall = float(prior_proj.get("projection_recall", 0.0))
     best_rmse = float(best_reg.get("colored_icp_inlier_rmse", best_reg.get("gicp_inlier_rmse", math.inf)))
     prior_rmse = float(prior_reg.get("colored_icp_inlier_rmse", prior_reg.get("gicp_inlier_rmse", math.inf)))
     best_fitness = float(best_reg.get("colored_icp_fitness", best_reg.get("gicp_fitness", 0.0)))
     prior_fitness = float(prior_reg.get("colored_icp_fitness", prior_reg.get("gicp_fitness", 0.0)))
     iou_gain = float(best_iou - prior_iou)
     precision_gain = float(best_precision - prior_precision)
+    recall_gain = float(best_recall - prior_recall)
     rmse_drop = float(prior_rmse - best_rmse) if np.isfinite(prior_rmse) and np.isfinite(best_rmse) else 0.0
     fitness_gain = float(best_fitness - prior_fitness)
     improves_iou = bool(best_iou > prior_iou + 1e-4)
     improves_precision = bool(best_precision > prior_precision + 1e-4)
+    improves_recall = bool(best_recall > prior_recall + 1e-4)
     improves_rmse = bool(best_rmse + 1e-6 < prior_rmse) if np.isfinite(prior_rmse) else bool(np.isfinite(best_rmse))
     improves_fitness = bool(best_fitness > prior_fitness + 1e-4)
     strong_accept = bool(
         improves_rmse
         and (
-            (improves_iou and (improves_precision or improves_fitness))
+            (improves_iou and (improves_recall or improves_precision or improves_fitness))
+            or (improves_recall and (improves_precision or improves_fitness))
             or (improves_precision and improves_fitness)
         )
     )
@@ -866,7 +885,8 @@ def _prior_compare_keep_decision(
         not strong_accept
         and improves_rmse
         and iou_gain >= -0.035
-        and precision_gain >= 0.03
+        and recall_gain >= 0.03
+        and precision_gain >= -0.02
         and fitness_gain >= 0.04
         and rmse_drop >= max(0.0030, 0.20 * max(prior_rmse, 1e-6))
         and best_iou >= max(0.22, prior_iou - 0.035)
@@ -877,6 +897,7 @@ def _prior_compare_keep_decision(
         and prior_iou >= 0.42
         and iou_gain >= -0.055
         and precision_gain >= -0.01
+        and recall_gain >= -0.01
         and fitness_gain >= 0.06
         and rmse_drop >= max(0.0035, 0.22 * max(prior_rmse, 1e-6))
     )
@@ -890,6 +911,8 @@ def _prior_compare_keep_decision(
             missing.append("rmse")
         if not improves_precision:
             missing.append("precision")
+        if not improves_recall:
+            missing.append("recall")
         if not improves_fitness:
             missing.append("fitness")
         reason = "refine_not_better_" + "_and_".join(missing)
@@ -904,14 +927,17 @@ def _prior_compare_keep_decision(
             "triggered": bool(keep_prior),
             "best_projection_iou": float(best_iou),
             "best_projection_precision": float(best_precision),
+            "best_projection_recall": float(best_recall),
             "best_rmse_m": float(best_rmse),
             "best_fitness": float(best_fitness),
             "prior_projection_iou": float(prior_iou),
             "prior_projection_precision": float(prior_precision),
+            "prior_projection_recall": float(prior_recall),
             "prior_rmse_m": float(prior_rmse),
             "prior_fitness": float(prior_fitness),
             "iou_gain": float(iou_gain),
             "precision_gain": float(precision_gain),
+            "recall_gain": float(recall_gain),
             "rmse_drop_m": float(rmse_drop),
             "fitness_gain": float(fitness_gain),
             "soft_tradeoff_accept": bool(soft_tradeoff_accept),
@@ -961,9 +987,11 @@ def _prefilter_fallback_seed_candidates(
         )
         proj_iou = float(proj_metrics.get("projection_iou", 0.0))
         proj_precision = float(proj_metrics.get("projection_precision", 0.0))
+        proj_recall = float(proj_metrics.get("projection_recall", 0.0))
         cheap_score = (
             proj_iou
-            + 0.35 * proj_precision
+            + 0.28 * proj_precision
+            + 0.40 * proj_recall
             + 0.05 * float(candidate.score_hint)
         )
         cheap_ranking.append(
@@ -974,6 +1002,7 @@ def _prefilter_fallback_seed_candidates(
                 "cheap_score": float(cheap_score),
                 "projection_iou": proj_iou,
                 "projection_precision": proj_precision,
+                "projection_recall": proj_recall,
                 "score_hint": float(candidate.score_hint),
             }
         )
@@ -983,6 +1012,7 @@ def _prefilter_fallback_seed_candidates(
         key=lambda item: (
             -float(item["cheap_score"]),
             -float(item["projection_iou"]),
+            -float(item["projection_recall"]),
             -float(item["projection_precision"]),
             int(item["index"]),
         ),
@@ -1005,7 +1035,14 @@ def _prefilter_fallback_seed_candidates(
         )
         vis = float(eval_metrics.get("visibility_score", 0.0))
         visible_count = float(eval_metrics.get("visible_count", 0.0))
-        invalid = bool(vis <= -1e8 or (item["projection_iou"] <= 1e-6 and item["projection_precision"] <= 1e-6))
+        invalid = bool(
+            vis <= -1e8
+            or (
+                item["projection_iou"] <= 1e-6
+                and item["projection_precision"] <= 1e-6
+                and item["projection_recall"] <= 1e-6
+            )
+        )
         pre_score = (
             float(item["cheap_score"])
             + 0.25 * float(np.clip(vis, 0.0, 1.0))
@@ -1029,7 +1066,11 @@ def _prefilter_fallback_seed_candidates(
             {
                 **item,
                 "pre_score": float(item["cheap_score"]),
-                "invalid": bool(item["projection_iou"] <= 1e-6 and item["projection_precision"] <= 1e-6),
+                "invalid": bool(
+                    item["projection_iou"] <= 1e-6
+                    and item["projection_precision"] <= 1e-6
+                    and item["projection_recall"] <= 1e-6
+                ),
                 "visibility_score": float("nan"),
                 "visible_count": 0.0,
                 "visibility_evaluated": False,
@@ -1042,6 +1083,7 @@ def _prefilter_fallback_seed_candidates(
             not bool(item["visibility_evaluated"]),
             -float(item["pre_score"]),
             -float(item["projection_iou"]),
+            -float(item["projection_recall"]),
             -float(item["projection_precision"]),
             int(item["index"]),
         ),
@@ -1061,6 +1103,7 @@ def _prefilter_fallback_seed_candidates(
                     **(candidate.metadata or {}),
                     "prefilter_projection_iou": float(item["projection_iou"]),
                     "prefilter_projection_precision": float(item["projection_precision"]),
+                    "prefilter_projection_recall": float(item["projection_recall"]),
                     "prefilter_visibility_score": float(item["visibility_score"]),
                     "prefilter_visible_count": float(item["visible_count"]),
                     "prefilter_cheap_score": float(item["cheap_score"]),
@@ -1105,6 +1148,7 @@ def coarse_fine_registration(
         "sam3d_micro_verify_strict",
         "sam3d_micro_verify_relaxed",
         "fallback_light",
+        "fallback_heavy",
     }:
         T_coarse = np.asarray(T_init, dtype=np.float64).reshape(4, 4)
         coarse_info = {"score": math.nan, "skipped": True}
@@ -1203,6 +1247,21 @@ def coarse_fine_registration(
             cfg,
             gicp_max_iter=min(int(cfg.gicp_max_iter), 24),
             colored_icp_max_iter=min(int(cfg.colored_icp_max_iter), 12),
+        )
+    elif search_mode == "fallback_heavy":
+        fine_cfg = replace(
+            cfg,
+            search_rx_deg=(-10.0, -5.0, 0.0, 5.0, 10.0),
+            search_ry_deg=(-10.0, -5.0, 0.0, 5.0, 10.0),
+            search_rz_deg=(-16.0, -8.0, 0.0, 8.0, 16.0),
+            search_tx_m=(0.0,),
+            search_ty_m=(0.0,),
+            search_tz_m=(0.0,),
+        )
+        refine_cfg = replace(
+            cfg,
+            gicp_max_iter=min(int(cfg.gicp_max_iter), 42),
+            colored_icp_max_iter=min(int(cfg.colored_icp_max_iter), 20),
         )
     else:
         fine_cfg = replace(
@@ -1344,21 +1403,25 @@ def _maybe_override_fallback_light_result(
     after: dict[str, Any],
     cfg: RegistrationConfig,
 ) -> tuple[np.ndarray, dict[str, Any], dict[str, Any], dict[str, Any]]:
-    if str(candidate.search_mode or "") != "fallback_light":
+    if str(candidate.search_mode or "") not in {"fallback_light", "fallback_heavy"}:
         return T_candidate, reg_debug, visibility, proj_metrics
     metadata = candidate.metadata or {}
     raw_iou = float(metadata.get("prefilter_projection_iou", 0.0))
     raw_precision = float(metadata.get("prefilter_projection_precision", 0.0))
-    if raw_iou <= 1e-6 and raw_precision <= 1e-6:
+    raw_recall = float(metadata.get("prefilter_projection_recall", 0.0))
+    if raw_iou <= 1e-6 and raw_precision <= 1e-6 and raw_recall <= 1e-6:
         return T_candidate, reg_debug, visibility, proj_metrics
 
     current_iou = float(proj_metrics.get("projection_iou", 0.0))
     current_precision = float(proj_metrics.get("projection_precision", 0.0))
+    current_recall = float(proj_metrics.get("projection_recall", 0.0))
     iou_drop = raw_iou - current_iou
     precision_drop = raw_precision - current_precision
+    recall_drop = raw_recall - current_recall
     current_rmse = float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf)))
     collapse = bool(
         (raw_iou >= 0.45 and current_iou + 0.18 < raw_iou and current_precision + 0.12 < raw_precision)
+        or (raw_recall >= 0.60 and current_recall + 0.12 < raw_recall and current_rmse >= 0.008)
         or (raw_iou >= 0.50 and current_iou < 0.25 and current_rmse >= 0.008)
     )
     if not collapse:
@@ -1383,10 +1446,13 @@ def _maybe_override_fallback_light_result(
         "reason": "prefilter_projection_regression",
         "raw_projection_iou": float(raw_iou),
         "raw_projection_precision": float(raw_precision),
+        "raw_projection_recall": float(raw_recall),
         "refined_projection_iou": float(current_iou),
         "refined_projection_precision": float(current_precision),
+        "refined_projection_recall": float(current_recall),
         "iou_drop": float(iou_drop),
         "precision_drop": float(precision_drop),
+        "recall_drop": float(recall_drop),
     }
     updated_debug["search_mode"] = "fallback_prefilter_keep"
     updated_debug["colored_icp_effective_source"] = "fallback_prefilter_keep"
@@ -1407,12 +1473,14 @@ def assess_quality(
     visibility_score: float,
     projection_iou: float = 0.0,
     projection_precision: float = 0.0,
+    projection_recall: float = 0.0,
 ) -> dict[str, Any]:
     quality = "good"
     reasons: list[str] = []
     strong_projection_support = bool(
         projection_iou >= 0.45
         and projection_precision >= 0.85
+        and projection_recall >= 0.60
         and visibility_score >= 0.45
         and reg_fitness >= 0.95
     )
@@ -1436,6 +1504,12 @@ def assess_quality(
     elif visibility_score < 0.18 and quality != "poor":
         quality = "fair"
         reasons.append(f"moderate visibility score ({visibility_score:.3f})")
+    if projection_recall < 0.30:
+        quality = "poor"
+        reasons.append(f"low projection recall ({projection_recall:.3f})")
+    elif projection_recall < 0.55 and quality != "poor":
+        quality = "fair"
+        reasons.append(f"moderate projection recall ({projection_recall:.3f})")
     return {"quality": quality, "reasons": reasons}
 
 
@@ -1742,6 +1816,7 @@ def run_reestimation(
             "visibility_score": float(visibility.get("score", 0.0)),
             "projection_iou": float(proj_metrics.get("projection_iou", 0.0)),
             "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
+            "projection_recall": float(proj_metrics.get("projection_recall", 0.0)),
             "rmse_m": float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
             "gicp_fitness": float(reg_debug.get("gicp_fitness", 0.0)),
             "metadata": candidate.metadata,
@@ -1752,7 +1827,9 @@ def run_reestimation(
             log_fn,
             f"seed[{index}] done tag={candidate.tag} total={(time.perf_counter() - t_candidate) * 1000.0:.1f} ms "
             f"score={selection_score:.4f} rmse={candidate_info['rmse_m']:.4f} "
-            f"proj_iou={candidate_info['projection_iou']:.3f} vis={candidate_info['visibility_score']:.3f}",
+            f"proj_iou={candidate_info['projection_iou']:.3f} "
+            f"recall={candidate_info['projection_recall']:.3f} "
+            f"vis={candidate_info['visibility_score']:.3f}",
         )
         if str(candidate.tag) in {"tapir_prior_keep", "sam3d_prior_keep"}:
             prior_result = {
@@ -1767,6 +1844,7 @@ def run_reestimation(
             }
         score_key = (
             float(selection_score),
+            -float(proj_metrics.get("projection_recall", 0.0)),
             -float(visibility.get("score", 0.0)),
             float(reg_debug.get("colored_icp_inlier_rmse", reg_debug.get("gicp_inlier_rmse", math.inf))),
             -float(proj_metrics.get("projection_precision", 0.0)),
@@ -1815,6 +1893,7 @@ def run_reestimation(
     debug["reg_visible_count"] = int(round(float(visibility.get("visible_count", 0.0))))
     debug["reg_depth_ok_ratio"] = float(visibility.get("depth_ok_ratio", 0.0))
     debug["reg_projection_precision"] = float(proj_metrics.get("projection_precision", 0.0))
+    debug["reg_projection_recall"] = float(proj_metrics.get("projection_recall", 0.0))
     debug["reg_projection_iou"] = float(proj_metrics.get("projection_iou", 0.0))
     debug["best_init"] = str(best_result["candidate"].tag)
     debug["best_score"] = float(best_result["selection_score"])
@@ -1835,6 +1914,7 @@ def run_reestimation(
         "candidate_count": int(len(seed_candidates)),
         "rotation_change_deg": _rotation_angle_deg(T_registration[:3, :3]),
         "projection_precision": float(proj_metrics.get("projection_precision", 0.0)),
+        "projection_recall": float(proj_metrics.get("projection_recall", 0.0)),
         "projection_iou": float(proj_metrics.get("projection_iou", 0.0)),
         "search_mode": str(reg_debug.get("search_mode", "")),
         "coarse_ms": int(reg_debug.get("coarse_ms", 0) or 0),
@@ -1878,6 +1958,7 @@ def run_reestimation(
         float(visibility.get("score", 0.0)),
         float(proj_metrics.get("projection_iou", 0.0)),
         float(proj_metrics.get("projection_precision", 0.0)),
+        float(proj_metrics.get("projection_recall", 0.0)),
     )
     debug["quality"] = quality
     debug["stage_timings_s"] = stage_timings
@@ -2151,6 +2232,9 @@ def _write_pair_outputs(
             "visibility_score": result.debug.get("reg_visibility_score"),
             "visible_count": result.debug.get("reg_visible_count"),
             "depth_ok_ratio": result.debug.get("reg_depth_ok_ratio"),
+            "projection_iou": result.debug.get("reg_projection_iou"),
+            "projection_precision": result.debug.get("reg_projection_precision"),
+            "projection_recall": result.debug.get("reg_projection_recall"),
         },
         "tapir_init": result.debug.get("tapir_init"),
         "sam3d_init": result.debug.get("sam3d_init"),
